@@ -1,0 +1,5 @@
+# Основные зависимости для Cursor Tool
+# Установка: pip install -r requirements.txt
+
+tkinter
+pillow>=9.0.0
