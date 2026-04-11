@@ -6,7 +6,9 @@ import random
 import string
 import subprocess
 import threading
+from concurrent.futures import ThreadPoolExecutor
 import json
+import re
 import ctypes
 import traceback
 import winreg
@@ -15,6 +17,8 @@ import struct
 import select
 import socketserver
 from urllib.parse import urlparse, urlsplit
+from urllib.request import Request, urlopen
+from urllib.error import HTTPError, URLError
 from pathlib import Path
 from datetime import datetime
 
@@ -191,6 +195,226 @@ def save_account(first, last, email_login, email_password, account_password, fil
     )
     with open(filepath, "a", encoding="utf-8") as f:
         f.write(entry)
+
+# ─── APP CONFIG (NotLetters API key, etc.) ───────────────────────────────────
+APP_CONFIG_FILENAME = "cursor_tool_config.json"
+NOTLETTERS_API_BASE = "https://api.notletters.com"
+# Cloudflare часто режет запросы с User-Agent Python-urllib (ошибка 1010).
+_NOTLETTERS_UA = (
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+    "(KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36"
+)
+
+def _app_config_path():
+    """
+    Standard Windows location for app configuration: %LOCALAPPDATA%\CursorTool
+    """
+    appdata = os.environ.get("LOCALAPPDATA") or os.environ.get("APPDATA")
+    if appdata:
+        config_dir = os.path.join(appdata, "CursorTool")
+        try:
+            os.makedirs(config_dir, exist_ok=True)
+        except Exception:
+            pass
+        new_path = os.path.join(config_dir, APP_CONFIG_FILENAME)
+        
+        # Migration logic: if old config exists in the script folder, move it to the new location.
+        old_path = data_file_path(APP_CONFIG_FILENAME)
+        if os.path.exists(old_path) and not os.path.exists(new_path):
+            try:
+                import shutil
+                shutil.move(old_path, new_path)
+            except Exception:
+                pass
+        return new_path
+    return data_file_path(APP_CONFIG_FILENAME)
+
+def load_app_config():
+    try:
+        path = _app_config_path()
+        if os.path.exists(path):
+            with open(path, "r", encoding="utf-8") as f:
+                data = json.load(f)
+            if isinstance(data, dict):
+                return data
+    except Exception:
+        pass
+    return {}
+
+def save_notletters_api_key(api_key):
+    cfg = load_app_config()
+    cfg["notletters_api_key"] = api_key or ""
+    try:
+        with open(_app_config_path(), "w", encoding="utf-8") as f:
+            json.dump(cfg, f, ensure_ascii=False, indent=2)
+    except Exception:
+        pass
+
+def notletters_fetch_letters(api_token, email, password, timeout=22, filters=None):
+    """POST /v1/letters — email и пароль ящика; опционально Bearer API-ключ и filters."""
+    url = f"{NOTLETTERS_API_BASE}/v1/letters"
+    body = {"email": (email or "").strip(), "password": password or ""}
+    if filters:
+        body["filters"] = filters
+    payload = json.dumps(body).encode("utf-8")
+    headers = {
+        "Content-Type": "application/json",
+        "Accept": "application/json, text/plain, */*",
+        "Accept-Language": "ru-RU,ru;q=0.9,en-US;q=0.8,en;q=0.7",
+        "User-Agent": _NOTLETTERS_UA,
+        "Origin": "https://notletters.com",
+        "Referer": "https://notletters.com/",
+    }
+    token = (api_token or "").strip()
+    if token:
+        headers["Authorization"] = f"Bearer {token}"
+    req = Request(url, data=payload, method="POST", headers=headers)
+    try:
+        with urlopen(req, timeout=timeout) as resp:
+            raw = resp.read().decode("utf-8", errors="replace")
+    except HTTPError as e:
+        err_body = ""
+        try:
+            err_body = e.read().decode("utf-8", errors="replace")
+        except Exception:
+            pass
+        raise RuntimeError(f"HTTP {e.code}: {err_body or e.reason}") from e
+    except URLError as e:
+        raise RuntimeError(f"Ошибка сети: {e.reason}") from e
+    try:
+        return json.loads(raw)
+    except json.JSONDecodeError as exc:
+        raise RuntimeError(f"Некорректный JSON в ответе API.") from exc
+
+def _notletters_letter_plain_text(letter_item):
+    inner = letter_item.get("letter") or {}
+    text = (inner.get("text") or "").strip()
+    if text:
+        return text
+    html = inner.get("html") or ""
+    if not html:
+        return ""
+    t = re.sub(r"(?is)<script[^>]*>.*?</script>", " ", html)
+    t = re.sub(r"(?is)<style[^>]*>.*?</style>", " ", t)
+    t = re.sub(r"<[^>]+>", " ", t)
+    return re.sub(r"\s+", " ", t).strip()
+
+def _is_verification_email_subject(subj):
+    """Тема вроде «Подтвердите ваш адрес электронной почты» и близкие варианты (RU/EN)."""
+    s = (subj or "").strip().lower().replace("ё", "е")
+    if not s:
+        return False
+    if "подтвердите" in s or "подтвержден" in s:
+        if any(k in s for k in ("почт", "электрон", "адрес", "email", "e-mail", "eмейл")):
+            return True
+    if "confirm" in s and ("email" in s or "mail" in s):
+        return True
+    if "verify" in s and ("email" in s or "e-mail" in s or "address" in s):
+        return True
+    return False
+
+def _notletters_date_key(item):
+    try:
+        return int(item.get("date") or 0)
+    except (TypeError, ValueError):
+        return 0
+
+def _letters_ordered_for_code_search(letters):
+    """Сначала письма с темой подтверждения почты (новые выше), затем остальные по дате."""
+    by_date = sorted(letters, key=_notletters_date_key, reverse=True)
+    pri, rest = [], []
+    for L in by_date:
+        (pri if _is_verification_email_subject(L.get("subject")) else rest).append(L)
+    return pri + rest
+
+_CODE_RES = (
+    re.compile(r"\b(\d{6})\b"),
+    re.compile(r"(?i)(?:code|код|otp|pin|verification)[^\d]{0,40}(\d{4,8})\b"),
+    re.compile(r"(?<![\d])(\d{4,8})(?![\d])"),
+)
+
+def _extract_code_from_single_letter(letter_item):
+    blob = _notletters_letter_plain_text(letter_item)
+    subj = letter_item.get("subject") or ""
+    sender = (letter_item.get("sender") or "") + " " + (letter_item.get("sender_name") or "")
+    combined = f"{blob}\n{subj}\n{sender}"
+    for cre in _CODE_RES:
+        m = cre.search(combined)
+        if m:
+            return m.group(1)
+    return None
+
+def extract_code_from_notletters_response(data):
+    """
+    Ищет код по письмам: приоритет у тем вроде «Подтвердите ваш адрес…», не только последнее письмо.
+    Возвращает (код или None, описание письма с которого взят код / последнего, число писем).
+    """
+    letters = []
+    if isinstance(data, dict):
+        inner = data.get("data") or {}
+        letters = inner.get("letters") or []
+    if not letters:
+        return None, None, 0
+
+    ordered = _letters_ordered_for_code_search(letters)
+    for L in ordered:
+        code = _extract_code_from_single_letter(L)
+        if code:
+            meta = f"{L.get('subject') or ''} | {L.get('sender') or ''}".strip(" |")
+            return code, meta, len(letters)
+
+    newest = max(letters, key=_notletters_date_key)
+    meta = f"{newest.get('subject') or ''} | {newest.get('sender') or ''}".strip(" |")
+    return None, meta, len(letters)
+
+def notletters_fetch_code_best_effort(api_token, email, password):
+    """
+    Два запроса к API параллельно (узкий search + полный ящик) — время ≈ max(оба), не сумма.
+    Код ищем сначала в ответе узкого поиска, затем в полном.
+    Возвращает (data, code, meta, n_letters, err_str).
+    """
+    email = (email or "").strip()
+    pwd = password or ""
+    token = (api_token or "").strip()
+
+    narrow_data = full_data = None
+    errs = []
+
+    with ThreadPoolExecutor(max_workers=2) as ex:
+        f_n = ex.submit(
+            notletters_fetch_letters,
+            token,
+            email,
+            pwd,
+            8,
+            {"search": "Подтвердите"},
+        )
+        f_f = ex.submit(notletters_fetch_letters, token, email, pwd, 10, None)
+        try:
+            narrow_data = f_n.result(timeout=12)
+        except Exception as e:
+            errs.append(str(e))
+        try:
+            full_data = f_f.result(timeout=12)
+        except Exception as e:
+            errs.append(str(e))
+
+    for data in (narrow_data, full_data):
+        if data is None:
+            continue
+        code, meta, n = extract_code_from_notletters_response(data)
+        if code:
+            return data, code, meta, n, None
+
+    if full_data is not None:
+        code, meta, n = extract_code_from_notletters_response(full_data)
+        return full_data, code, meta, n, None
+    if narrow_data is not None:
+        code, meta, n = extract_code_from_notletters_response(narrow_data)
+        return narrow_data, code, meta, n, None
+
+    err = errs[0] if len(errs) == 1 else ("; ".join(errs) if errs else "Нет ответа от API")
+    return None, None, None, 0, err
 
 def _refresh_internet_settings():
     INTERNET_OPTION_SETTINGS_CHANGED = 39
@@ -752,12 +976,18 @@ class App(tk.Tk):
         self.gen_pass   = tk.StringVar()
         self.gen_email_login = tk.StringVar()
         self.gen_email_pass = tk.StringVar()
+        self.notletters_api_var = tk.StringVar()
+        self.notletters_code_var = tk.StringVar(value="")
         self.proxy_var = tk.StringVar()
         self.proxy_type_var = tk.StringVar(value="SOCKS5")
         self.status_var = tk.StringVar(value="Готов к работе")
 
+        _cfg = load_app_config()
+        self.notletters_api_var.set(_cfg.get("notletters_api_key") or "")
+
         self._detect_mail_file()
         self._build_ui()
+        self.protocol("WM_DELETE_WINDOW", self._on_close)
         self.update_idletasks()
         self._center()
 
@@ -815,28 +1045,33 @@ class App(tk.Tk):
         outer = tk.Frame(self, bg=BG, padx=0, pady=0)
         outer.pack(fill="both", expand=True)
 
-        # ── Header ────────────────────────────────────────────────────────────
-        header = tk.Frame(outer, bg=BG, padx=22, pady=14)
-        header.pack(fill="x")
-        tk.Label(header, text="Cursor Tool", bg=BG, fg=TEXT,
-                 font=("Segoe UI", 19, "bold"), justify="center").pack(anchor="center")
-        tk.Label(header, text="Сброс Cursor ID, аккаунты и управление прокси",
-                 bg=BG, fg=TEXT_DIM, font=("Segoe UI", 10), justify="center").pack(anchor="center", pady=(2, 0))
+        # ── Header with Logo (Centered) ───────────────────────────────────────
+        header_cont = tk.Frame(outer, bg=BG, pady=20)
+        header_cont.pack(fill="x")
+        
+        # Inner frame to hold logo + text, centered
+        inner_header = tk.Frame(header_cont, bg=BG)
+        inner_header.pack(anchor="center")
 
-        # ── Banner image ──────────────────────────────────────────────────────
         img_path = self._find_banner_image()
         if PIL_AVAILABLE and img_path and os.path.exists(img_path):
             try:
                 img = Image.open(img_path)
-                banner_w = max(self.window_w - 120, 700)
-                img = img.resize((banner_w, 220), Image.LANCZOS)
+                logo_w, logo_h = 120, 100
+                img = img.resize((logo_w, logo_h), Image.LANCZOS)
                 self._banner = ImageTk.PhotoImage(img)
-                banner_lbl = tk.Label(outer, image=self._banner, bg=BG, bd=0)
-                banner_lbl.pack(pady=(0, 2))
+                logo_lbl = tk.Label(inner_header, image=self._banner, bg=BG, bd=0)
+                logo_lbl.pack(side="left", padx=(0, 20))
             except Exception:
-                self._placeholder_banner(outer)
-        else:
-            self._placeholder_banner(outer)
+                pass
+
+        header_text = tk.Frame(inner_header, bg=BG)
+        header_text.pack(side="left", fill="y")
+        
+        tk.Label(header_text, text="Cursor Tool", bg=BG, fg=TEXT,
+                 font=("Segoe UI", 24, "bold"), justify="left").pack(anchor="w")
+        tk.Label(header_text, text="Сброс Cursor ID, аккаунты и управление прокси",
+                 bg=BG, fg=TEXT_DIM, font=("Segoe UI", 11), justify="left").pack(anchor="w", pady=(2, 0))
 
         # ── Main card (2 columns) ─────────────────────────────────────────────
         card = tk.Frame(outer, bg=SURFACE, padx=18, pady=16, highlightthickness=1, highlightbackground=BORDER)
@@ -913,9 +1148,13 @@ class App(tk.Tk):
         links_frame = tk.Frame(left_col, bg=SURFACE3, padx=12, pady=10, highlightthickness=1, highlightbackground=BORDER)
         links_frame.pack(fill="x")
         links = [
-            ("Cursor", "https://cursor.com/"),
-            ("Удобная почта", "https://notletters.com/email/login"),
-            ("Создатель CursorTools", "https://pr0cr4st1n4t10n.github.io/"),
+            ("Cursor", "https://cursor.com/dashboard/settings"),
+            ("Войти в почту", "https://notletters.com/email/login"),
+            ("Купить почты (напрямую)", "https://notletters.com/user"),
+            ("Купить почты (через посредника)", "https://t.me/GloryProjectBot"),
+            ("Получить Ваш API ключ NotLetters", "https://notletters.com/user/settings"),
+	    ("Инструкция по CursorTool / GitHub CursorTool", "https://github.com/pr0cr4st1n4t10n/CursorTool"),
+            ("Разработчик CursorTool", "https://pr0cr4st1n4t10n.github.io/"),
         ]
         for title, url in links:
             row = tk.Frame(links_frame, bg=SURFACE3)
@@ -940,6 +1179,44 @@ class App(tk.Tk):
         ]
         for label, var in fields:
             self._gen_row(fields_box, label, var)
+
+        nl_block = tk.Frame(right_col, bg=SURFACE3, padx=12, pady=10, highlightthickness=1, highlightbackground=BORDER)
+        nl_block.pack(fill="x", pady=(0, 12))
+        sec_label(nl_block, "NOTLETTERS API").pack(anchor="w", pady=(0, 6))
+        api_row = tk.Frame(nl_block, bg=SURFACE3)
+        api_row.pack(fill="x", pady=(0, 8))
+        tk.Label(api_row, text="API-ключ", bg=SURFACE3, fg=TEXT_DIM,
+                 font=("Segoe UI", 9), width=16, anchor="w").pack(side="left")
+        self.notletters_api_entry = styled_entry(api_row, textvariable=self.notletters_api_var, width=28, show="•")
+        self.notletters_api_entry.pack(side="left", fill="x", expand=True, padx=(4, 0))
+        self.notletters_api_entry.bind("<FocusOut>", lambda e: self._persist_notletters_api())
+        big_button(
+            nl_block,
+            "Получить последний код с почты NotLetters",
+            self._fetch_last_code_notletters,
+            ACCENT2,
+        ).pack(fill="x")
+
+        code_row = tk.Frame(nl_block, bg=SURFACE3)
+        code_row.pack(fill="x", pady=(10, 0))
+        tk.Label(
+            code_row,
+            text="Код",
+            bg=SURFACE3,
+            fg=TEXT_DIM,
+            font=("Segoe UI", 9),
+            width=16,
+            anchor="w",
+        ).pack(side="left")
+        self.notletters_code_entry = styled_entry(
+            code_row,
+            textvariable=self.notletters_code_var,
+            font=("Consolas", 12),
+        )
+        self.notletters_code_entry.pack(side="left", fill="x", expand=True, padx=(4, 8))
+        self.notletters_code_entry.config(state="readonly", readonlybackground=SURFACE2)
+        copy_nl = icon_button(code_row, "Скопировать", self._copy_notletters_code_field)
+        copy_nl.pack(side="left")
 
         sec_label(right_col, "ЛОГ").pack(anchor="w", pady=(0, 6))
         log_box = tk.Frame(right_col, bg=SURFACE3, padx=10, pady=10, highlightthickness=1, highlightbackground=BORDER)
@@ -1227,6 +1504,107 @@ class App(tk.Tk):
             self.status_var.set("Ошибка отключения прокси")
             messagebox.showerror("Прокси", f"Не удалось отключить прокси:\n{e}")
 
+    def _on_close(self):
+        self._persist_notletters_api()
+        self.destroy()
+
+    def _persist_notletters_api(self):
+        save_notletters_api_key(self.notletters_api_var.get())
+
+    def _set_notletters_code_field(self, text):
+        self.notletters_code_var.set(text or "")
+        ent = self.notletters_code_entry
+        ent.config(state="normal")
+        ent.delete(0, "end")
+        if text:
+            ent.insert(0, text)
+        ent.config(state="readonly")
+
+    def _copy_notletters_code_field(self):
+        t = (self.notletters_code_var.get() or "").strip()
+        if not t:
+            self.status_var.set("Поле кода пустое")
+            return
+        self.clipboard_clear()
+        self.clipboard_append(t)
+        self.log(f"Скопирован код: {t}")
+        self.status_var.set("Код скопирован в буфер обмена")
+
+    def _fetch_last_code_notletters(self):
+        api_key = self.notletters_api_var.get().strip()
+        email = self.gen_email_login.get().strip()
+        pwd = self.gen_email_pass.get().strip()
+        if not api_key:
+            messagebox.showwarning("NotLetters", "Введите API-ключ NotLetters.")
+            return
+        if not email or not pwd:
+            messagebox.showwarning(
+                "NotLetters",
+                "Нет данных почты.\nСначала сгенерируйте аккаунт или заполните поля «Почта (логин)» и «Почта (пароль)».",
+            )
+            return
+        self._set_notletters_code_field("")
+        self.log("Запрос писем через NotLetters API (параллельно: фильтр + полный ящик)…")
+        self.status_var.set("Загрузка почты NotLetters…")
+
+        def work():
+            code = meta = None
+            n_letters = 0
+            err = None
+            try:
+                _data, code, meta, n_letters, err = notletters_fetch_code_best_effort(
+                    api_key, email, pwd
+                )
+            except Exception as e:
+                err = str(e)
+            self.after(
+                0,
+                lambda c=code, m=meta, n=n_letters, er=err: self._on_notletters_fetch_done(c, m, n, er),
+            )
+
+        threading.Thread(target=work, daemon=True).start()
+
+    def _on_notletters_fetch_done(self, code, meta, n_letters, err):
+        self._persist_notletters_api()
+        if err:
+            self._set_notletters_code_field("")
+            self.log(f"✗ NotLetters API: {err}")
+            self.status_var.set("Ошибка NotLetters API")
+            messagebox.showerror("NotLetters", f"Не удалось получить письма:\n{err}")
+            return
+        self.log(f"✓ Ответ API: писем в ящике: {n_letters}")
+        if n_letters == 0:
+            self._set_notletters_code_field("")
+            self.log("  В ящике пока нет писем.")
+            self.status_var.set("Нет писем в ящике")
+            messagebox.showinfo("NotLetters", "В ящике нет писем.")
+            return
+        if code:
+            self._set_notletters_code_field(code)
+            self.clipboard_clear()
+            self.clipboard_append(code)
+            self.log(f"✓ Код из письма: {code}")
+            if meta:
+                self.log(f"  ({meta})")
+            self.status_var.set("Код получен (также в буфере обмена)")
+            self._show_toast(
+                f"Код: {code}\nСкопирован в буфер; можно скопировать снова кнопкой.",
+                3800,
+                "#14532d",
+                "#dcfce7",
+            )
+        else:
+            self._set_notletters_code_field("")
+            self.log("⚠ В последнем письме не удалось распознать код автоматически.")
+            if meta:
+                self.log(f"  Письмо: {meta}")
+            self.status_var.set("Код в письме не найден")
+            messagebox.showinfo(
+                "NotLetters",
+                "Письма получены, но код не распознан автоматически.\n"
+                "Откройте почту на сайте или проверьте текст письма вручную.",
+            )
+
 # ─── WIDGET HELPERS ────────────────────────────────────────────────────────────
 def sec_label(parent, text):
     return tk.Label(parent, text=text, bg=parent["bg"], fg=TEXT_MUTED,
@@ -1236,15 +1614,22 @@ def sep(parent):
     return tk.Frame(parent, bg=BORDER, height=1)
 
 def styled_entry(parent, **kw):
-    e = tk.Entry(parent, bg=SURFACE2, fg=TEXT, font=("Segoe UI", 10),
-                 bd=0, relief="flat", insertbackground=ACCENT,
-                 highlightthickness=1, highlightcolor=ACCENT,
-                 highlightbackground=BORDER,
-                 disabledbackground=SURFACE2,
-                 disabledforeground=TEXT_DIM,
-                 readonlybackground=SURFACE2,
-                 **kw)
-    return e
+    opts = {
+        "bg": SURFACE2,
+        "fg": TEXT,
+        "font": ("Segoe UI", 10),
+        "bd": 0,
+        "relief": "flat",
+        "insertbackground": ACCENT,
+        "highlightthickness": 1,
+        "highlightcolor": ACCENT,
+        "highlightbackground": BORDER,
+        "disabledbackground": SURFACE2,
+        "disabledforeground": TEXT_DIM,
+        "readonlybackground": SURFACE2,
+    }
+    opts.update(kw)
+    return tk.Entry(parent, **opts)
 
 def icon_button(parent, text, cmd):
     b = tk.Button(parent, text=text, bg=SURFACE2, fg=TEXT,
