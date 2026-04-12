@@ -9,6 +9,9 @@ import threading
 from concurrent.futures import ThreadPoolExecutor
 import json
 import re
+import time
+import tempfile
+import math
 import ctypes
 import traceback
 import winreg
@@ -27,6 +30,9 @@ try:
     PIL_AVAILABLE = True
 except ImportError:
     PIL_AVAILABLE = False
+
+# Буфер обмена при вставке в браузер (регистрация) — потокобезопасно с pyperclip.
+_CLIPBOARD_LOCK = threading.Lock()
 
 # ─── COLORS ────────────────────────────────────────────────────────────────────
 BG        = "#0d0d0f"
@@ -415,6 +421,493 @@ def notletters_fetch_code_best_effort(api_token, email, password):
 
     err = errs[0] if len(errs) == 1 else ("; ".join(errs) if errs else "Нет ответа от API")
     return None, None, None, 0, err
+
+def _windows_http_url_progid():
+    """ProgId браузера по умолчанию для http(s) в Windows."""
+    try:
+        with winreg.OpenKey(
+            winreg.HKEY_CURRENT_USER,
+            r"Software\Microsoft\Windows\Shell\Associations\UrlAssociations\http\UserChoice",
+        ) as key:
+            return (winreg.QueryValueEx(key, "Progid")[0] or "").strip()
+    except OSError:
+        return ""
+
+def _set_page_load_eager(options):
+    """Не ждать полной загрузки всех ресурсов — меньше «висит» на пустой странице / data:."""
+    try:
+        options.page_load_strategy = "eager"
+    except Exception:
+        try:
+            options.set_capability("pageLoadStrategy", "eager")
+        except Exception:
+            pass
+
+def _configure_chromium_stealth_options(options):
+    """Меньше признаков автоматизации: без баннера «управляет тестовое ПО» и без AutomationControlled."""
+    options.add_argument("--disable-blink-features=AutomationControlled")
+    options.add_experimental_option("excludeSwitches", ["enable-automation"])
+    options.add_experimental_option("useAutomationExtension", False)
+
+def _chromium_apply_stealth_cdp(driver):
+    """Скрывает navigator.webdriver на новых документах (дополнительно к флагам запуска)."""
+    try:
+        driver.execute_cdp_cmd(
+            "Page.addScriptToEvaluateOnNewDocument",
+            {
+                "source": """
+                    Object.defineProperty(navigator, 'webdriver', { get: () => undefined });
+                    try { delete navigator.__proto__.webdriver; } catch (e) {}
+                    if (!window.chrome) { window.chrome = { runtime: {} }; }
+                """
+            },
+        )
+    except Exception:
+        pass
+
+def _chromium_temp_user_data_arg(instance_index):
+    """Временный профиль Chromium: отдельные куки/хранилище на каждую регистрацию и параллельные окна."""
+    if instance_index is None:
+        return None
+    d = tempfile.mkdtemp(prefix=f"cursor_reg_{instance_index}_")
+    return f"--user-data-dir={d}"
+
+
+def _chromium_lang_for_instance(instance_index):
+    """Разные Accept-Language между окнами (не идентичные настройки сессии)."""
+    if instance_index is None:
+        return None
+    langs = (
+        "ru-RU,ru",
+        "en-US,en",
+        "en-GB,en",
+        "de-DE,de",
+        "fr-FR,fr",
+        "es-ES,es",
+    )
+    return langs[instance_index % len(langs)]
+
+
+def _windows_primary_work_area():
+    """Рабочая область монитора (с учётом панели задач), Win32."""
+    class RECT(ctypes.Structure):
+        _fields_ = [
+            ("left", ctypes.c_long),
+            ("top", ctypes.c_long),
+            ("right", ctypes.c_long),
+            ("bottom", ctypes.c_long),
+        ]
+
+    r = RECT()
+    SPI_GETWORKAREA = 0x0030
+    try:
+        ok = ctypes.windll.user32.SystemParametersInfoW(
+            SPI_GETWORKAREA, 0, ctypes.byref(r), 0
+        )
+        if ok:
+            w = r.right - r.left
+            h = r.bottom - r.top
+            if w > 80 and h > 80:
+                return int(r.left), int(r.top), w, h
+    except Exception:
+        pass
+    w = int(ctypes.windll.user32.GetSystemMetrics(0))
+    h = int(ctypes.windll.user32.GetSystemMetrics(1))
+    return 0, 0, w, h
+
+
+def _tile_rect_for_browser(instance_index, total, gap=8):
+    """
+    Прямоугольник окна браузера на экране: сетка ~sqrt(N) столбцов,
+    чтобы 2–5 окон не перекрывали друг друга.
+    """
+    wx, wy, ww, wh = _windows_primary_work_area()
+    if total <= 1:
+        return wx, wy, ww, wh
+    cols = max(1, int(math.ceil(math.sqrt(total))))
+    rows = max(1, int(math.ceil(total / cols)))
+    usable_w = max(1, ww - gap * (cols + 1))
+    usable_h = max(1, wh - gap * (rows + 1))
+    cw = max(1, usable_w // cols)
+    ch = max(1, usable_h // rows)
+    col = instance_index % cols
+    row = instance_index // cols
+    x = wx + gap + col * (cw + gap)
+    y = wy + gap + row * (ch + gap)
+    x += random.randint(-2, 2)
+    y += random.randint(-2, 2)
+    return x, y, cw, ch
+
+
+def selenium_apply_window_layout(driver, instance_index, parallel_total):
+    """Одно окно — на весь экран; несколько — плиткой по рабочей области."""
+    try:
+        if parallel_total <= 1:
+            driver.maximize_window()
+            return
+        x, y, w, h = _tile_rect_for_browser(instance_index, parallel_total)
+        driver.set_window_rect(x=x, y=y, width=w, height=h)
+    except Exception:
+        try:
+            driver.maximize_window()
+        except Exception:
+            pass
+
+
+def selenium_create_driver_windows_default(log_fn=None, instance_index=None):
+    """
+    WebDriver под системный браузер по умолчанию (Edge / Chrome / Firefox).
+    При ошибке перебирает другие варианты.
+    """
+    from selenium import webdriver
+    from selenium.webdriver.chrome.options import Options as ChromeOptions
+    from selenium.webdriver.edge.options import Options as EdgeOptions
+
+    log_fn = log_fn or (lambda _m: None)
+    pl = _windows_http_url_progid().lower()
+    ud_arg = _chromium_temp_user_data_arg(instance_index)
+    lang_arg = _chromium_lang_for_instance(instance_index)
+
+    def edge():
+        o = EdgeOptions()
+        o.add_experimental_option("detach", True)
+        _set_page_load_eager(o)
+        _configure_chromium_stealth_options(o)
+        o.add_argument("--window-size=1366,768")
+        if lang_arg:
+            o.add_argument(f"--lang={lang_arg}")
+        if ud_arg:
+            o.add_argument(ud_arg)
+        drv = webdriver.Edge(options=o)
+        _chromium_apply_stealth_cdp(drv)
+        return drv
+
+    def chrome():
+        try:
+            import undetected_chromedriver as uc
+            o = uc.ChromeOptions()
+            _set_page_load_eager(o)
+            o.add_argument("--window-size=1366,768")
+            if lang_arg:
+                o.add_argument(f"--lang={lang_arg}")
+            if ud_arg:
+                o.add_argument(ud_arg)
+            drv = uc.Chrome(options=o)
+            return drv
+        except ImportError:
+            o = ChromeOptions()
+            o.add_experimental_option("detach", True)
+            _set_page_load_eager(o)
+            _configure_chromium_stealth_options(o)
+            o.add_argument("--window-size=1366,768")
+            if lang_arg:
+                o.add_argument(f"--lang={lang_arg}")
+            if ud_arg:
+                o.add_argument(ud_arg)
+            drv = webdriver.Chrome(options=o)
+            _chromium_apply_stealth_cdp(drv)
+            return drv
+
+    def firefox():
+        from selenium.webdriver.firefox.options import Options as FirefoxOptions
+
+        o = FirefoxOptions()
+        o.set_preference("dom.webdriver.enabled", False)
+        return webdriver.Firefox(options=o)
+
+    named = []
+    if "firefox" in pl:
+        named.append(("Firefox", firefox))
+    if "chrome" in pl or "chromium" in pl or "brave" in pl:
+        named.append(("Chrome", chrome))
+    if "edge" in pl or "msedge" in pl:
+        named.append(("Edge", edge))
+    if not named:
+        named = [("Edge", edge), ("Chrome", chrome), ("Firefox", firefox)]
+    else:
+        for label, fn in (("Edge", edge), ("Chrome", chrome), ("Firefox", firefox)):
+            if fn not in [x[1] for x in named]:
+                named.append((label, fn))
+
+    last_err = None
+    for label, factory in named:
+        try:
+            drv = factory()
+            hint = pl or "не задан"
+            log_fn(f"Регистрация: браузер для автоматизации — {label} (ProgId http: {hint})")
+            return drv
+        except Exception as e:
+            last_err = e
+            log_fn(f"⚠ Не удалось запустить {label}: {e}")
+    raise last_err
+
+def get_chrome_version():
+    """Пытается определить версию Chrome"""
+    try:
+        key = winreg.OpenKey(winreg.HKEY_LOCAL_MACHINE, r"Software\Google\Chrome\BLBeacon")
+        version, _ = winreg.QueryValueEx(key, "version")
+        return version.split('.')[0]
+    except:
+        try:
+            key = winreg.OpenKey(winreg.HKEY_CURRENT_USER, r"Software\Google\Chrome\BLBeacon")
+            version, _ = winreg.QueryValueEx(key, "version")
+            return version.split('.')[0]
+        except:
+            return None
+
+def selenium_create_registration_driver(log_fn=None, instance_index=None):
+    """
+    Драйвер для регистрации: приоритет Chrome (undetected), затем обычный Chrome,
+    затем системный браузер по умолчанию.
+    instance_index: для Chromium — временный user-data-dir и свой --lang на каждое окно (0, 1, …).
+    Если None — без отдельного профиля и без смены языка (для совместимости).
+    """
+    log_fn = log_fn or (lambda _m: None)
+    log_fn("Запуск браузера для регистрации...")
+
+    from selenium import webdriver
+    try:
+        import undetected_chromedriver as uc
+        use_uc = True
+    except ImportError:
+        use_uc = False
+
+    chrome_version = get_chrome_version()
+    if chrome_version:
+        log_fn(f"Обнаружена версия Chrome: {chrome_version}")
+
+    ud_arg = _chromium_temp_user_data_arg(instance_index)
+    lang_arg = _chromium_lang_for_instance(instance_index)
+
+    # Попытка 1: undetected_chromedriver
+    if use_uc:
+        try:
+            log_fn("Используем undetected_chromedriver...")
+            from selenium.webdriver.chrome.options import Options as ChromeOptions
+            o = uc.ChromeOptions()
+            _set_page_load_eager(o)
+            o.add_argument("--window-size=1366,768")
+            o.add_argument("--no-first-run")
+            o.add_argument("--no-default-browser-check")
+            o.add_argument("--disable-blink-features=AutomationControlled")
+            if lang_arg:
+                o.add_argument(f"--lang={lang_arg}")
+            if ud_arg:
+                o.add_argument(ud_arg)
+            
+            if chrome_version:
+                try:
+                    drv = uc.Chrome(options=o, version_main=int(chrome_version))
+                except Exception:
+                    drv = uc.Chrome(options=o)
+            else:
+                drv = uc.Chrome(options=o)
+            
+            log_fn("✓ undetected_chromedriver запущен успешно")
+            return drv
+        except Exception as e:
+            log_fn(f"⚠ undetected_chromedriver не сработал: {e}")
+
+    # Попытка 2: Обычный Chrome с нашими stealth-настройками
+    try:
+        log_fn("Попытка обычного Chrome WebDriver с улучшенным скрытием...")
+        from selenium.webdriver.chrome.options import Options as ChromeOptions
+        o = ChromeOptions()
+        o.add_experimental_option("detach", True)
+        _set_page_load_eager(o)
+        _configure_chromium_stealth_options(o)
+        o.add_argument("--window-size=1366,768")
+        if lang_arg:
+            o.add_argument(f"--lang={lang_arg}")
+        if ud_arg:
+            o.add_argument(ud_arg)
+        drv = webdriver.Chrome(options=o)
+        _chromium_apply_stealth_cdp(drv)
+        log_fn("✓ Обычный Chrome WebDriver запущен")
+        return drv
+    except Exception as e:
+        log_fn(f"⚠ Ошибка при запуске обычного Chrome: {e}")
+
+    # Попытка 3: Системный по умолчанию (Edge/Firefox)
+    try:
+        log_fn("Попытка системного браузера по умолчанию...")
+        return selenium_create_driver_windows_default(log_fn, instance_index=instance_index)
+    except Exception as e:
+        log_fn(f"✗ Ошибка системного браузера: {e}")
+
+    messagebox.showerror("Ошибка браузера",
+        "Не удалось запустить браузер.\n\n"
+        "Решения:\n"
+        "1. Обновите Google Chrome и Edge до последней версии\n"
+        "2. Установите: pip install undetected-chromedriver\n"
+        "3. Убедитесь, что нет зависших процессов браузера")
+    raise Exception("Не удалось создать WebDriver")
+
+def _human_move_and_click(driver, element, *, quick=False):
+    """
+    Подвести курсор к элементу с короткими «дрожащими» шагами и нажать.
+    Кнопки и поля ввода. quick=True — укороченная траектория (например OTP по ячейкам).
+    """
+    from selenium.webdriver.common.action_chains import ActionChains
+
+    driver.execute_script("arguments[0].scrollIntoView({block:'center'});", element)
+    time.sleep(random.uniform(0.02, 0.06) if quick else random.uniform(0.04, 0.11))
+    try:
+        ac = ActionChains(driver)
+        ox = random.randint(-10, 10) if quick else random.randint(-14, 14)
+        oy = random.randint(-5, 5) if quick else random.randint(-8, 8)
+        ac.move_to_element_with_offset(element, ox, oy)
+        n_steps = random.randint(1, 2) if quick else random.randint(2, 5)
+        w = 3 if quick else 5
+        for _ in range(n_steps):
+            ac.move_by_offset(random.randint(-w, w), random.randint(-w, w))
+            ac.pause(
+                random.uniform(0.01, 0.03)
+                if quick
+                else random.uniform(0.015, 0.045)
+            )
+        ac.move_by_offset(random.randint(-2, 2), random.randint(-2, 2))
+        ac.pause(
+            random.uniform(0.03, 0.07)
+            if quick
+            else random.uniform(0.05, 0.12)
+        )
+        ac.click()
+        ac.perform()
+    except Exception:
+        element.click()
+
+def _selenium_paste_human(driver, element, text, *, quick=False):
+    """
+    Как вручную: клик в поле, очистка, вставка из буфера (Ctrl+V).
+    Снижает срабатывание капчи по сравнению с посимвольным send_keys.
+    """
+    from selenium.webdriver.common.keys import Keys
+
+    if text is None:
+        return
+    text = str(text)
+    _human_move_and_click(driver, element, quick=quick)
+    time.sleep(random.uniform(0.07, 0.18))
+    try:
+        element.clear()
+    except Exception:
+        pass
+    time.sleep(random.uniform(0.06, 0.14))
+    try:
+        import pyperclip
+        from selenium.webdriver.common.action_chains import ActionChains
+        # Вся последовательность под замком: иначе параллельные окна затирают буфер друг другу.
+        with _CLIPBOARD_LOCK:
+            pyperclip.copy(text)
+            time.sleep(random.uniform(0.12, 0.25))
+
+            # Попытка 1: ActionChains (эмуляция реального нажатия клавиш)
+            try:
+                ac = ActionChains(driver)
+                ac.key_down(Keys.CONTROL).send_keys('v').key_up(Keys.CONTROL).perform()
+            except Exception:
+                # Попытка 2: Передача через send_keys (fallback)
+                element.send_keys(Keys.CONTROL + "v")
+
+            # Попытка 3: Эмуляция события вставки через JS (для сложных OTP-полей)
+            time.sleep(0.1)
+            driver.execute_script("""
+                var el = arguments[0];
+                var val = arguments[1];
+                if (el.value.length < val.length) {
+                    var data = new DataTransfer();
+                    data.setData('text/plain', val);
+                    var ev = new ClipboardEvent('paste', {
+                        clipboardData: data,
+                        bubbles: true,
+                        cancelable: true
+                    });
+                    el.dispatchEvent(ev);
+                    // Если после пасты все еще пусто или мало символов, пробуем прямо в value (fallback)
+                    if (el.value.length < 1) {
+                        el.value = val;
+                        el.dispatchEvent(new Event('input', { bubbles: true }));
+                    }
+                }
+            """, element, text)
+    except Exception:
+        _selenium_type_human(driver, element, text, fast=quick)
+        return
+    time.sleep(random.uniform(0.1, 0.22))
+
+def _selenium_type_into(driver, element, text):
+    try:
+        element.click()
+    except Exception:
+        pass
+    try:
+        element.clear()
+    except Exception:
+        pass
+    try:
+        element.send_keys(text)
+    except Exception:
+        driver.execute_script(
+            "arguments[0].focus && arguments[0].focus();"
+            "arguments[0].value = arguments[1];"
+            "arguments[0].dispatchEvent(new Event('input', {bubbles:true}));"
+            "arguments[0].dispatchEvent(new Event('change', {bubbles:true}));",
+            element,
+            text,
+        )
+
+def _selenium_type_human(driver, element, text, *, fast=False):
+    """
+    Ввод по символам со случайными паузами (как при наборе с клавиатуры).
+    Не подставляет value через JS — так реже триггерится антибот.
+    """
+    from selenium.webdriver.common.keys import Keys
+
+    if text is None:
+        return
+    text = str(text)
+    try:
+        _human_move_and_click(driver, element, quick=fast)
+    except Exception:
+        try:
+            element.click()
+        except Exception:
+            pass
+    time.sleep(random.uniform(0.04, 0.1))
+    try:
+        element.clear()
+    except Exception:
+        pass
+    time.sleep(random.uniform(0.05, 0.12))
+    lo, hi = (0.02, 0.048) if fast else (0.038, 0.088)
+    for ch in text:
+        element.send_keys(ch)
+        if ch in " @._-+":
+            time.sleep(random.uniform(0.07, 0.14))
+        else:
+            time.sleep(random.uniform(lo, hi))
+        if not fast and random.random() < 0.038:
+            time.sleep(random.uniform(0.1, 0.28))
+
+def _selenium_click_first(driver, candidates, timeout_each=6, humanize=False):
+    from selenium.webdriver.support.ui import WebDriverWait
+    from selenium.webdriver.support import expected_conditions as EC
+
+    for by, sel in candidates:
+        try:
+            el = WebDriverWait(driver, timeout_each).until(EC.element_to_be_clickable((by, sel)))
+            if humanize:
+                time.sleep(random.uniform(0.08, 0.22))
+                _human_move_and_click(driver, el)
+            else:
+                driver.execute_script("arguments[0].scrollIntoView({block:'center'});", el)
+                time.sleep(0.12)
+                el.click()
+            return True
+        except Exception:
+            continue
+    return False
 
 def _refresh_internet_settings():
     INTERNET_OPTION_SETTINGS_CHANGED = 39
@@ -981,6 +1474,7 @@ class App(tk.Tk):
         self.proxy_var = tk.StringVar()
         self.proxy_type_var = tk.StringVar(value="SOCKS5")
         self.status_var = tk.StringVar(value="Готов к работе")
+        self.accounts_gen_reg_count_var = tk.IntVar(value=1)
 
         _cfg = load_app_config()
         self.notletters_api_var.set(_cfg.get("notletters_api_key") or "")
@@ -1101,6 +1595,33 @@ class App(tk.Tk):
         btn_row2 = tk.Frame(btn_block, bg=SURFACE3)
         btn_row2.pack(fill="x", pady=(8, 0))
         big_button(btn_row2, "Сгенерировать все аккаунты из файла", self._generate_all_accounts, "#14532d").pack(fill="x")
+        reg_scale_row = tk.Frame(btn_block, bg=SURFACE3)
+        reg_scale_row.pack(fill="x", pady=(8, 4))
+        tk.Label(
+            reg_scale_row,
+            text="Аккаунтов (сгенерировать и зарегистрировать, 1–5):",
+            bg=SURFACE3,
+            fg=TEXT_DIM,
+            font=("Segoe UI", 9),
+        ).pack(side="left", padx=(0, 8))
+        tk.Scale(
+            reg_scale_row,
+            variable=self.accounts_gen_reg_count_var,
+            from_=1,
+            to=5,
+            orient="horizontal",
+            length=200,
+            showvalue=True,
+            resolution=1,
+            bg=SURFACE3,
+            fg=TEXT,
+            highlightthickness=0,
+            troughcolor=SURFACE2,
+            activebackground=ACCENT,
+        ).pack(side="left", fill="x", expand=True)
+        btn_row3 = tk.Frame(btn_block, bg=SURFACE3)
+        btn_row3.pack(fill="x", pady=(4, 0))
+        big_button(btn_row3, "Сгенерировать и зарегистрировать", self._generate_and_register_accounts, "#1d4ed8").pack(fill="x")
 
         proxy_block = tk.Frame(left_col, bg=SURFACE3, padx=12, pady=12, highlightthickness=1, highlightbackground=BORDER)
         proxy_block.pack(fill="x", pady=(0, 12))
@@ -1218,11 +1739,19 @@ class App(tk.Tk):
         copy_nl = icon_button(code_row, "Скопировать", self._copy_notletters_code_field)
         copy_nl.pack(side="left")
 
-        sec_label(right_col, "ЛОГ").pack(anchor="w", pady=(0, 6))
+        log_header = tk.Frame(right_col, bg=right_col["bg"])
+        log_header.pack(fill="x", pady=(0, 6))
+        sec_label(log_header, "ЛОГ").pack(side="left")
+        
+        tk.Button(log_header, text="📋 Скопировать", bg=ACCENT, fg="#fff",
+                  font=("Segoe UI", 8, "bold"), bd=0, padx=10, pady=3,
+                  activebackground=ACCENT2, cursor="hand2", relief="flat",
+                  command=self._copy_all_logs).pack(side="right")
+
         log_box = tk.Frame(right_col, bg=SURFACE3, padx=10, pady=10, highlightthickness=1, highlightbackground=BORDER)
         log_box.pack(fill="both", expand=True)
         self.log_text = tk.Text(log_box, height=16, bg=SURFACE2, fg="#b8b8d9",
-                                font=("Consolas", 8), bd=0, relief="flat",
+                                font=("Consolas", 9), bd=0, relief="flat",
                                 insertbackground=ACCENT, wrap="word",
                                 state="disabled")
         self.log_text.pack(fill="both", expand=True)
@@ -1292,6 +1821,394 @@ class App(tk.Tk):
         import webbrowser
         webbrowser.open(url)
 
+    def _generate_and_register_accounts(self):
+        try:
+            import selenium  # noqa: F401
+        except ImportError:
+            messagebox.showerror(
+                "Нет Selenium",
+                "Установите зависимости:\npip install selenium pyperclip undetected-chromedriver\n\n"
+                "Нужен браузер по умолчанию в Windows (Edge, Chrome или Firefox). "
+                "pyperclip — вставка в поля как вручную (Ctrl+V).",
+            )
+            return
+
+        try:
+            n = int(self.accounts_gen_reg_count_var.get())
+        except (TypeError, ValueError):
+            n = 1
+        n = max(1, min(5, n))
+
+        path = self.mail_path.get().strip()
+        if not path:
+            messagebox.showwarning(
+                "Почты",
+                "Укажите файл с почтами — для каждого аккаунта нужна отдельная строка login:password.",
+            )
+            return
+        if not os.path.exists(path):
+            messagebox.showwarning("Почты", f"Файл не найден:\n{path}")
+            return
+
+        available = count_email_credentials_in_file(path)
+        if available < n:
+            messagebox.showwarning(
+                "Почты",
+                f"В файле только {available} записей, а выбрано {n} аккаунтов.\n"
+                "Добавьте строки login:password или уменьшите ползунок.",
+            )
+            return
+
+        api_key = self.notletters_api_var.get().strip()
+        if not api_key:
+            messagebox.showwarning(
+                "NotLetters",
+                "Введите API-ключ NotLetters — по нему запрашивается код из письма.",
+            )
+            return
+
+        threading.Thread(
+            target=self._generate_and_register_accounts_worker,
+            args=(n, path, api_key),
+            daemon=True,
+        ).start()
+
+    def _apply_snap_to_generated_fields(self, snap):
+        """Подставить в поля UI данные одного сгенерированного аккаунта (последний из пачки)."""
+        self.gen_first.set(snap["first"])
+        self.gen_last.set(snap["last"])
+        self.gen_pass.set(snap["account_pass"])
+        self.gen_email_login.set(snap["email"])
+        self.gen_email_pass.set(snap["email_pass"])
+
+    def _generate_and_register_accounts_worker(self, n, path, api_key):
+        """Фон: для каждого слота — взять почту из файла, сгенерировать личность, сохранить, затем регистрация."""
+        snaps = []
+        for idx in range(n):
+            creds = pop_email_credentials_from_file(path)
+            if not creds:
+                self.log(f"✗ [{idx + 1}/{n}] Нет строки почты в файле — прерываю генерацию.")
+                break
+            email_login, email_password = creds
+            first = random.choice(FIRST_NAMES)
+            last = random.choice(LAST_NAMES)
+            pwd = generate_password()
+            save_account(
+                first,
+                last,
+                email_login,
+                email_password,
+                pwd,
+                filepath=data_file_path("accounts.txt"),
+            )
+            snap = {
+                "first": first,
+                "last": last,
+                "email": email_login,
+                "email_pass": email_password,
+                "account_pass": pwd,
+                "api": api_key,
+            }
+            snaps.append(snap)
+            mail_info = email_login if email_login else "без почты"
+            self.log(f"✓ [{len(snaps)}/{n}] Сгенерирован аккаунт: {first} {last} | {mail_info}")
+
+        if not snaps:
+            self.after(
+                0,
+                lambda: messagebox.showerror(
+                    "Генерация",
+                    "Не удалось сгенерировать ни одного аккаунта (нет почт в файле).",
+                ),
+            )
+            return
+
+        last_snap = snaps[-1]
+        self.after(0, lambda s=last_snap: self._apply_snap_to_generated_fields(s))
+
+        self.log(f"Запуск регистрации в браузере для {len(snaps)} аккаунт(ов)…")
+
+        if len(snaps) == 1:
+            threading.Thread(
+                target=self._register_with_generated_data_worker,
+                args=(snaps[0],),
+                kwargs={"instance_id": 0, "parallel_total": 1},
+                daemon=True,
+            ).start()
+        else:
+            threading.Thread(
+                target=self._register_parallel_supervisor,
+                args=(snaps,),
+                daemon=True,
+            ).start()
+
+    def _register_parallel_supervisor(self, snaps):
+        """Несколько окон с разными snap; общий снимок буфера до/после."""
+        if not snaps:
+            return
+        n = len(snaps)
+        self.log(f"Регистрация: параллельно {n} окон (по одному на аккаунт)…")
+
+        clip_snapshot = None
+        try:
+            import pyperclip
+            with _CLIPBOARD_LOCK:
+                try:
+                    clip_snapshot = pyperclip.paste()
+                except Exception:
+                    clip_snapshot = None
+        except ImportError:
+            pass
+
+        threads = []
+
+        def _run_reg(snap, idx, total):
+            time.sleep(0.28 * idx + random.uniform(0, 0.14))
+            self._register_with_generated_data_worker(
+                snap, instance_id=idx, parallel_total=total
+            )
+
+        for i, snap in enumerate(snaps):
+            t = threading.Thread(
+                target=_run_reg,
+                args=(snap, i, n),
+                daemon=True,
+            )
+            threads.append(t)
+            t.start()
+        for t in threads:
+            t.join()
+
+        if clip_snapshot is not None:
+            try:
+                import pyperclip
+                with _CLIPBOARD_LOCK:
+                    pyperclip.copy(clip_snapshot)
+            except Exception:
+                pass
+
+    def _register_with_generated_data_worker(self, snap, instance_id=0, parallel_total=1):
+        from selenium.webdriver.common.by import By
+        from selenium.webdriver.support.ui import WebDriverWait
+        from selenium.webdriver.support import expected_conditions as EC
+        from selenium.common.exceptions import TimeoutException
+
+        signup_url = "https://authenticator.cursor.sh/sign-up"
+        first = snap["first"]
+        last = snap["last"]
+        email = snap["email"]
+        email_pass = snap["email_pass"]
+        account_pass = snap["account_pass"]
+        api_key = snap["api"]
+
+        owns_clipboard_restore = parallel_total == 1
+        clip_snapshot = None
+        if owns_clipboard_restore:
+            try:
+                import pyperclip
+                with _CLIPBOARD_LOCK:
+                    try:
+                        clip_snapshot = pyperclip.paste()
+                    except Exception:
+                        clip_snapshot = None
+            except ImportError:
+                pass
+
+        log_reg = (
+            (lambda m: self.log(f"[окно {instance_id + 1}/{parallel_total}] {m}"))
+            if parallel_total > 1
+            else self.log
+        )
+        # Всегда отдельный временный профиль — не смешивать с основным Chrome и не дублировать куки между регистрациями.
+        profile_idx = instance_id
+
+        def _fill_first_matching(locators, value, per=6):
+            for by, sel in locators:
+                try:
+                    el = WebDriverWait(driver, per).until(EC.visibility_of_element_located((by, sel)))
+                    if el.is_displayed():
+                        _selenium_type_human(driver, el, value, fast=True)
+                        time.sleep(random.uniform(0.14, 0.32))
+                        return True
+                except TimeoutException:
+                    continue
+            return False
+
+        def _switch_latest_tab():
+            handles = driver.window_handles
+            if len(handles) > 1:
+                driver.switch_to.window(handles[-1])
+
+        def _find_otp_single():
+            for by, sel in (
+                (By.CSS_SELECTOR, "input[autocomplete='one-time-code']"),
+                (By.CSS_SELECTOR, "input[inputmode='numeric']"),
+                (By.XPATH, "//input[contains(@placeholder,'код') or contains(@placeholder,'Код') or contains(@placeholder,'code') or contains(@placeholder,'Code')]"),
+            ):
+                for el in driver.find_elements(by, sel):
+                    try:
+                        t = (el.get_attribute("type") or "").lower()
+                        if t in ("password", "email", "hidden"):
+                            continue
+                        if el.is_displayed() and el.get_attribute("maxlength") != "1":
+                            return el
+                    except Exception:
+                        continue
+            return None
+
+        def _find_otp_multi():
+            els = driver.find_elements(By.CSS_SELECTOR, "input[inputmode='numeric'][maxlength='1']")
+            vis = [e for e in els if e.is_displayed()]
+            return vis if len(vis) >= 4 else None
+
+        driver = None
+        try:
+            driver = selenium_create_registration_driver(log_reg, instance_index=profile_idx)
+            selenium_apply_window_layout(driver, instance_id, parallel_total)
+            time.sleep(random.uniform(0.08, 0.22) * instance_id)
+            log_reg(
+                "Регистрация: заполнение полей (имя, фамилия, почта)..."
+            )
+            log_reg(f"Регистрация: открываю {signup_url}")
+            driver.get(signup_url)
+            time.sleep(random.uniform(0.45, 0.95))
+
+            first_locs = [
+                (By.CSS_SELECTOR, "input[autocomplete='given-name']"),
+                (By.CSS_SELECTOR, "input[name='firstName']"),
+                (By.CSS_SELECTOR, "input[name='first_name']"),
+                (By.XPATH, "//label[contains(.,'Ваше имя')]//following::input[1]"),
+                (By.XPATH, "//label[contains(.,'имя')][not(contains(.,'фамил'))]//following::input[1]"),
+            ]
+            last_locs = [
+                (By.CSS_SELECTOR, "input[autocomplete='family-name']"),
+                (By.CSS_SELECTOR, "input[name='lastName']"),
+                (By.CSS_SELECTOR, "input[name='last_name']"),
+                (By.XPATH, "//label[contains(.,'фамилия') or contains(.,'Фамилия')]//following::input[1]"),
+            ]
+            email_locs = [
+                (By.CSS_SELECTOR, "input[autocomplete='email']"),
+                (By.CSS_SELECTOR, "input[type='email']"),
+                (By.CSS_SELECTOR, "input[name='email']"),
+                (By.XPATH, "//label[contains(.,'почт') or contains(.,'Почт') or contains(.,'email') or contains(.,'Email')]//following::input[1]"),
+            ]
+
+            if not _fill_first_matching(first_locs, first):
+                raise TimeoutException("Не найдено поле «Ваше имя» на странице регистрации.")
+            if not _fill_first_matching(last_locs, last):
+                raise TimeoutException("Не найдено поле «Ваша фамилия».")
+            if not _fill_first_matching(email_locs, email):
+                raise TimeoutException("Не найдено поле электронной почты.")
+
+            submit_locs = [
+                (By.CSS_SELECTOR, "button[type='submit']"),
+                (By.XPATH, "//button[contains(.,'Continue')]"),
+                (By.XPATH, "//button[contains(.,'Продолжить')]"),
+                (By.XPATH, "//button[contains(.,'Sign up')]"),
+                (By.XPATH, "//button[contains(.,'Далее')]"),
+            ]
+            if not _selenium_click_first(driver, submit_locs, timeout_each=12, humanize=True):
+                log_reg("⚠ Регистрация: не нашёл кнопку отправки формы — нажмите вручную в браузере.")
+
+            log_reg(
+                "Регистрация: если появилась капча — решите её; жду поле пароля аккаунта (до 5 мин)…"
+            )
+            self.after(0, lambda: self.status_var.set("Капча/пароль: решите капчу при необходимости…"))
+            try:
+                WebDriverWait(driver, 300).until(
+                    EC.visibility_of_element_located((By.CSS_SELECTOR, "input[type='password']"))
+                )
+            except TimeoutException:
+                raise TimeoutException("Не появилось поле пароля (возможна капча или другой экран).") from None
+
+            time.sleep(random.uniform(0.22, 0.5))
+            _switch_latest_tab()
+            pwd_inputs = [e for e in driver.find_elements(By.CSS_SELECTOR, "input[type='password']") if e.is_displayed()]
+            if not pwd_inputs:
+                raise TimeoutException("Поля пароля не видны.")
+            for inp in pwd_inputs:
+                _selenium_type_human(driver, inp, account_pass, fast=True)
+                time.sleep(random.uniform(0.1, 0.26))
+
+            if not _selenium_click_first(driver, submit_locs, timeout_each=10, humanize=True):
+                log_reg("⚠ Регистрация: нажмите кнопку продолжения после пароля вручную.")
+
+            time.sleep(random.uniform(0.4, 0.85))
+            _switch_latest_tab()
+
+            log_reg("Регистрация: опрашиваю NotLetters и жду поле для кода (до ~4 мин)…")
+            self.after(0, lambda: self.status_var.set("Запрос кода с почты…"))
+
+            code = None
+            deadline = time.time() + 240
+            otp_single = None
+            otp_multi = None
+            while time.time() < deadline:
+                try:
+                    _data, code_try, meta, _n, err = notletters_fetch_code_best_effort(api_key, email, email_pass)
+                    if err:
+                        pass
+                    elif code_try:
+                        code = code_try
+                        log_reg(f"Регистрация: код из письма: {code}" + (f" ({meta})" if meta else ""))
+                        self.after(0, lambda c=code: self._set_notletters_code_field(c))
+                except Exception as ex:
+                    log_reg(f"⚠ Запрос кода NotLetters: {ex}")
+
+                otp_multi = _find_otp_multi()
+                otp_single = _find_otp_single() if not otp_multi else None
+                if code and (otp_single or otp_multi):
+                    break
+                if not code:
+                    self.after(
+                        0,
+                        lambda: self.status_var.set("Жду письмо с кодом и поле ввода на странице…"),
+                    )
+                time.sleep(4)
+
+            if not code:
+                raise TimeoutException("Код из почты не получен за отведённое время. Проверьте API-ключ и ящик.")
+
+            wait_otp_deadline = time.time() + 90
+            while time.time() < wait_otp_deadline and not otp_single and not otp_multi:
+                otp_multi = _find_otp_multi()
+                otp_single = _find_otp_single() if not otp_multi else None
+                time.sleep(1)
+
+            if otp_multi:
+                raw = (code or "").strip()
+                log_reg("Регистрация: ввод кода в многоячеечное поле (6 цифр)...")
+                # Вставляем код целиком в первую ячейку — большинство OTP-полей распределяют его сами.
+                # Это надёжнее и быстрее, чем ввод по одной цифре.
+                _selenium_paste_human(driver, otp_multi[0], raw, quick=True)
+                time.sleep(random.uniform(0.5, 0.8))
+                log_reg("Регистрация: код вставлен в первую ячейку.")
+            elif otp_single:
+                _selenium_paste_human(driver, otp_single, code, quick=True)
+                log_reg("Регистрация: код введён в одиночное поле.")
+            else:
+                raise TimeoutException(
+                    "Код получен, но поле для ввода кода на странице не найдено. Введите код вручную."
+                )
+
+            self.after(0, lambda: self.status_var.set("Код введён в браузер"))
+        except TimeoutException as e:
+            msg = str(e) or "Таймаут ожидания на странице."
+            log_reg(f"✗ Регистрация: {msg}")
+            self.after(0, lambda m=msg: messagebox.showerror("Регистрация", m))
+        except Exception as e:
+            msg = str(e) or type(e).__name__
+            log_reg(f"✗ Регистрация: {msg}")
+            self.after(0, lambda m=msg: messagebox.showerror("Регистрация", m))
+        finally:
+            if owns_clipboard_restore and clip_snapshot is not None:
+                try:
+                    import pyperclip
+                    with _CLIPBOARD_LOCK:
+                        pyperclip.copy(clip_snapshot)
+                except Exception:
+                    pass
+
     def _copy(self, text):
         if text:
             self.clipboard_clear()
@@ -1336,9 +2253,26 @@ class App(tk.Tk):
         menu.add_command(label="Очистить", command=lambda: self.proxy_var.set(""))
         menu.tk_popup(event.x_root, event.y_root)
 
+    def _copy_all_logs(self):
+        try:
+            self.log_text.config(state="normal")
+            content = self.log_text.get("1.0", "end").strip()
+            self.log_text.config(state="disabled")
+
+            if not content:
+                messagebox.showinfo("Логи", "Лог пустой")
+                return
+
+            self.clipboard_clear()
+            self.clipboard_append(content)
+            messagebox.showinfo("Успешно", "Все логи скопированы в буфер обмена!")
+        except Exception as e:
+            messagebox.showerror("Ошибка", f"Не удалось скопировать логи:\n{e}")
+
     def _log(self, msg):
         self.log_text.config(state="normal")
-        self.log_text.insert("end", msg + "\n")
+        timestamp = datetime.now().strftime("%H:%M:%S")
+        self.log_text.insert("end", f"[{timestamp}] {msg}\n")
         self.log_text.see("end")
         self.log_text.config(state="disabled")
 
