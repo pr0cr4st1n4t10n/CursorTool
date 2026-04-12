@@ -3,3 +3,5 @@
 
 tkinter
 pillow>=9.0.0
+selenium>=4.15.0
+pyperclip>=1.8.2
