@@ -6,10 +6,14 @@ import random
 import string
 import subprocess
 import threading
-from concurrent.futures import ThreadPoolExecutor
 import json
 import re
 import time
+from concurrent.futures import ThreadPoolExecutor, TimeoutError as FuturesTimeoutError
+import imaplib
+import email as email_lib
+from email.header import decode_header
+from email.utils import parsedate_to_datetime
 import tempfile
 import math
 import ctypes
@@ -19,7 +23,7 @@ import socket
 import struct
 import select
 import socketserver
-from urllib.parse import urlparse, urlsplit
+from urllib.parse import urlparse, urlsplit, urlencode
 from urllib.request import Request, urlopen
 from urllib.error import HTTPError, URLError
 from pathlib import Path
@@ -33,6 +37,7 @@ except ImportError:
 
 # Буфер обмена при вставке в браузер (регистрация) — потокобезопасно с pyperclip.
 _CLIPBOARD_LOCK = threading.Lock()
+_FILE_COMMIT_LOCK = threading.Lock()
 
 # ─── COLORS ────────────────────────────────────────────────────────────────────
 BG        = "#0d0d0f"
@@ -125,94 +130,105 @@ def generate_password(length=12):
             any(c.isdigit() for c in pwd)):
             return pwd
 
+def _parse_email_credential_line(line):
+    line = (line or "").strip()
+    if not line:
+        return None
+    delim = None
+    for d in [":", ";", "|", ",", "\t"]:
+        if d in line:
+            delim = d
+            break
+    if not delim:
+        return None
+    left, right = line.split(delim, 1)
+    login = left.strip()
+    password = right.strip()
+    if login and password:
+        return line, login, password
+    return None
+
 def count_email_credentials_in_file(path):
     """Count valid login/password lines (read-only, does not modify the file)."""
     try:
         with open(path, "r", encoding="utf-8") as f:
             lines = [l.strip() for l in f.readlines()]
-        n = 0
-        for line in lines:
-            if not line:
-                continue
-            delim = None
-            for d in [":", ";", "|", ",", "\t"]:
-                if d in line:
-                    delim = d
-                    break
-            if not delim:
-                continue
-            left, right = line.split(delim, 1)
-            login = left.strip()
-            password = right.strip()
-            if login and password:
-                n += 1
-        return n
+        return sum(1 for line in lines if _parse_email_credential_line(line))
     except Exception:
         return 0
 
-def pop_email_credentials_from_file(path):
-    """Read first login/password from file, remove it, return tuple or None."""
+def list_email_credentials_from_file(path):
+    """Read all login/password pairs without modifying the file."""
     try:
         with open(path, "r", encoding="utf-8") as f:
             lines = [l.strip() for l in f.readlines()]
-        parsed = []
+        result = []
         for line in lines:
-            if not line:
-                continue
-            delim = None
-            for d in [":", ";", "|", ",", "\t"]:
-                if d in line:
-                    delim = d
-                    break
-            if not delim:
-                continue
-            left, right = line.split(delim, 1)
-            login = left.strip()
-            password = right.strip()
-            if login and password:
-                parsed.append((line, login, password))
+            parsed = _parse_email_credential_line(line)
+            if parsed:
+                result.append((parsed[1], parsed[2]))
+        return result
+    except Exception:
+        return []
 
-        if not parsed:
-            return None
-
-        first_line, login, password = parsed[0]
+def remove_email_credentials_from_file(path, login):
+    """Remove first line matching login from file."""
+    login = (login or "").strip()
+    if not login:
+        return False
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            lines = [l.strip() for l in f.readlines()]
         rest = []
         removed = False
         for line in lines:
-            if not removed and line == first_line:
-                removed = True
-                continue
+            if not removed:
+                parsed = _parse_email_credential_line(line)
+                if parsed and parsed[1] == login:
+                    removed = True
+                    continue
             rest.append(line)
-
+        if not removed:
+            return False
         with open(path, "w", encoding="utf-8") as f:
             f.write("\n".join(rest) + ("\n" if rest else ""))
-        return login, password
+        return True
     except Exception:
+        return False
+
+def pop_email_credentials_from_file(path):
+    """Read first login/password from file, remove it, return tuple or None."""
+    creds = list_email_credentials_from_file(path)
+    if not creds:
         return None
+    login, password = creds[0]
+    if remove_email_credentials_from_file(path, login):
+        return login, password
+    return None
+
+def format_account_line(email_login, email_password, account_password):
+    """email:pass или email:pass:cursor_pass если пароли различаются."""
+    login = (email_login or "").strip()
+    mail_pass = email_password or ""
+    acc_pass = account_password or ""
+    if acc_pass and acc_pass != mail_pass:
+        return f"{login}:{mail_pass}:{acc_pass}\n"
+    return f"{login}:{mail_pass}\n"
 
 def save_account(first, last, email_login, email_password, account_password, filepath="accounts.txt"):
-    entry = (
-        f"Имя: {first}\n"
-        f"Фамилия: {last}\n"
-        f"Почта (логин): {email_login}\n"
-        f"Почта (пароль): {email_password}\n"
-        f"Пароль аккаунта: {account_password}\n"
-        f"{'─' * 38}\n"
-    )
     with open(filepath, "a", encoding="utf-8") as f:
-        f.write(entry)
+        f.write(format_account_line(email_login, email_password, account_password))
 
-# ─── APP CONFIG (NotLetters API key, etc.) ───────────────────────────────────
+# ─── APP CONFIG ──────────────────────────────────────────────────────────────
 APP_CONFIG_FILENAME = "cursor_tool_config.json"
-NOTLETTERS_API_BASE = "https://api.notletters.com"
 # Cloudflare часто режет запросы с User-Agent Python-urllib (ошибка 1010).
-_NOTLETTERS_UA = (
+_HTTP_UA = (
     "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
     "(KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36"
 )
 
 def _app_config_path():
-    """
+    r"""
     Standard Windows location for app configuration: %LOCALAPPDATA%\CursorTool
     """
     appdata = os.environ.get("LOCALAPPDATA") or os.environ.get("APPDATA")
@@ -247,52 +263,344 @@ def load_app_config():
         pass
     return {}
 
-def save_notletters_api_key(api_key):
+def save_app_config_values(**updates):
     cfg = load_app_config()
-    cfg["notletters_api_key"] = api_key or ""
+    cfg.update(updates)
     try:
         with open(_app_config_path(), "w", encoding="utf-8") as f:
             json.dump(cfg, f, ensure_ascii=False, indent=2)
     except Exception:
         pass
 
-def notletters_fetch_letters(api_token, email, password, timeout=22, filters=None):
-    """POST /v1/letters — email и пароль ящика; опционально Bearer API-ключ и filters."""
-    url = f"{NOTLETTERS_API_BASE}/v1/letters"
-    body = {"email": (email or "").strip(), "password": password or ""}
-    if filters:
-        body["filters"] = filters
-    payload = json.dumps(body).encode("utf-8")
-    headers = {
-        "Content-Type": "application/json",
-        "Accept": "application/json, text/plain, */*",
-        "Accept-Language": "ru-RU,ru;q=0.9,en-US;q=0.8,en;q=0.7",
-        "User-Agent": _NOTLETTERS_UA,
-        "Origin": "https://notletters.com",
-        "Referer": "https://notletters.com/",
-    }
-    token = (api_token or "").strip()
-    if token:
-        headers["Authorization"] = f"Bearer {token}"
-    req = Request(url, data=payload, method="POST", headers=headers)
+# ─── EMAIL (Rambler IMAP) ────────────────────────────────────────────────────
+RAMBLER_IMAP_HOST = "imap.rambler.ru"
+RAMBLER_IMAP_PORT = 993
+ACCOUNT_PASSWORD_MODES = ("generated", "email", "custom")
+
+def resolve_account_password(mode, email_password="", custom_password=""):
+    """Пароль для регистрации Cursor: сгенерированный, от почты или свой."""
+    m = (mode or "generated").strip().lower()
+    if m == "email":
+        ep = (email_password or "").strip()
+        return ep if ep else generate_password()
+    if m == "custom":
+        cp = (custom_password or "").strip()
+        return cp if cp else generate_password()
+    return generate_password()
+
+def _decode_email_header(value):
+    if not value:
+        return ""
+    chunks = []
+    for part, charset in decode_header(value):
+        if isinstance(part, bytes):
+            chunks.append(part.decode(charset or "utf-8", errors="replace"))
+        else:
+            chunks.append(part or "")
+    return "".join(chunks).strip()
+
+def _email_message_plain_text(msg):
+    """Текст письма (plain; при отсутствии — упрощённый HTML)."""
+    if msg.is_multipart():
+        plain_parts, html_parts = [], []
+        for part in msg.walk():
+            if part.get_content_maintype() == "multipart":
+                continue
+            payload = part.get_payload(decode=True)
+            if not payload:
+                continue
+            charset = part.get_content_charset() or "utf-8"
+            text = payload.decode(charset, errors="replace")
+            ctype = (part.get_content_type() or "").lower()
+            if ctype == "text/plain":
+                plain_parts.append(text)
+            elif ctype == "text/html":
+                html_parts.append(text)
+        if plain_parts:
+            return "\n".join(plain_parts).strip()
+        if html_parts:
+            t = html_parts[0]
+            t = re.sub(r"(?is)<script[^>]*>.*?</script>", " ", t)
+            t = re.sub(r"(?is)<style[^>]*>.*?</style>", " ", t)
+            t = re.sub(r"<[^>]+>", " ", t)
+            return re.sub(r"\s+", " ", t).strip()
+        return ""
+
+    payload = msg.get_payload(decode=True)
+    if not payload:
+        return (msg.get_payload() or "").strip()
+    charset = msg.get_content_charset() or "utf-8"
+    text = payload.decode(charset, errors="replace")
+    if (msg.get_content_type() or "").lower() == "text/html":
+        text = re.sub(r"(?is)<script[^>]*>.*?</script>", " ", text)
+        text = re.sub(r"(?is)<style[^>]*>.*?</style>", " ", text)
+        text = re.sub(r"<[^>]+>", " ", text)
+        text = re.sub(r"\s+", " ", text).strip()
+    return text.strip()
+
+def _email_date_key(msg):
+    try:
+        dt = parsedate_to_datetime(msg.get("Date") or "")
+        return int(dt.timestamp()) if dt else 0
+    except Exception:
+        return 0
+
+def rambler_fetch_code_best_effort(email_addr, password):
+    """
+    Чтение ящика Rambler по IMAP; поиск кода подтверждения только в письмах от Cursor.
+    Возвращает (data, code, meta, n_letters, err_str).
+    """
+    login = (email_addr or "").strip()
+    pwd = password or ""
+    if not login or not pwd:
+        return None, None, None, 0, "Не указаны логин или пароль почты Rambler."
+
+    mail = None
+    try:
+        mail = imaplib.IMAP4_SSL(RAMBLER_IMAP_HOST, RAMBLER_IMAP_PORT)
+        mail.login(login, pwd)
+        status, _ = mail.select("INBOX")
+        if status != "OK":
+            return None, None, None, 0, "Не удалось открыть папку INBOX."
+
+        status, messages = mail.search(None, "ALL")
+        if status != "OK":
+            return None, None, None, 0, "Не удалось получить список писем."
+
+        ids = messages[0].split() if messages and messages[0] else []
+        if not ids:
+            return None, None, None, 0, None
+
+        letters = []
+        for eid in reversed(ids[-25:]):
+            status, data = mail.fetch(eid, "(RFC822)")
+            if status != "OK" or not data or not data[0]:
+                continue
+            raw = data[0][1]
+            if not raw:
+                continue
+            msg = email_lib.message_from_bytes(raw)
+            subj = _decode_email_header(msg.get("Subject"))
+            sender = _decode_email_header(msg.get("From"))
+            body = _email_message_plain_text(msg)
+            letters.append({
+                "subject": subj,
+                "sender": sender,
+                "sender_name": "",
+                "date": _email_date_key(msg),
+                "letter": {"text": body, "html": ""},
+            })
+
+        if not letters:
+            return None, None, None, 0, None
+
+        cursor_letters = [L for L in letters if _is_cursor_email(L)]
+        if not cursor_letters:
+            return None, None, None, len(letters), None
+
+        ordered = _letters_ordered_for_code_search(cursor_letters)
+        for letter in ordered:
+            code = _extract_code_from_single_letter(letter)
+            if code:
+                meta = f"{letter.get('subject') or ''} | {letter.get('sender') or ''}".strip(" |")
+                return letter, code, meta, len(cursor_letters), None
+
+        newest = max(cursor_letters, key=_letter_date_key)
+        meta = f"{newest.get('subject') or ''} | {newest.get('sender') or ''}".strip(" |")
+        return newest, None, meta, len(cursor_letters), None
+    except imaplib.IMAP4.error as e:
+        return None, None, None, 0, f"Ошибка IMAP Rambler: {e}"
+    except OSError as e:
+        return None, None, None, 0, f"Сеть/IMAP Rambler: {e}"
+    except Exception as e:
+        return None, None, None, 0, str(e)
+    finally:
+        if mail is not None:
+            try:
+                mail.logout()
+            except Exception:
+                pass
+
+def fetch_verification_code_best_effort(email, password):
+    """Чтение кода подтверждения из почты Rambler (только письма от Cursor)."""
+    return rambler_fetch_code_best_effort(email, password)
+
+# ─── BRINGSMS (SMS-Activate compatible) ───────────────────────────────────────
+BRINGSMS_API_BASE = "https://api.bring-sms.store/stubs/handler_api.php"
+BRINGSMS_SERVICE_ANY_OTHER = "ot"
+
+def _parse_rub_price(value):
+    """Парсит сумму в ₽ из поля UI: 5, 5.5, 5р, 5 ₽ и т.п."""
+    if value is None:
+        return None
+    s = str(value).strip()
+    if not s:
+        return None
+    s = s.replace(",", ".")
+    s = re.sub(r"[^\d.\-]", "", s)
+    if not s or s in (".", "-", "-."):
+        return None
+    try:
+        return float(s)
+    except ValueError:
+        return None
+
+def _bringsms_ot_entry(services):
+    """
+    Запись цены Any Other (ot) из getPrices.
+    С service=ot API отдаёт {cost, count} напрямую; без service — {ot: {cost, count}}.
+    """
+    if not isinstance(services, dict):
+        return None
+    nested = services.get(BRINGSMS_SERVICE_ANY_OTHER)
+    if isinstance(nested, dict):
+        return nested
+    if any(k in services for k in ("cost", "price", "count")):
+        return services
+    return None
+
+def bringsms_api_call(api_key, action, timeout=25, **extra):
+    params = {"api_key": (api_key or "").strip(), "action": action}
+    for k, v in extra.items():
+        if v is not None and v != "":
+            params[k] = v
+    url = f"{BRINGSMS_API_BASE}?{urlencode(params)}"
+    req = Request(url, headers={"User-Agent": _HTTP_UA, "Accept": "text/plain, application/json"})
     try:
         with urlopen(req, timeout=timeout) as resp:
-            raw = resp.read().decode("utf-8", errors="replace")
+            return resp.read().decode("utf-8", errors="replace").strip()
     except HTTPError as e:
         err_body = ""
         try:
             err_body = e.read().decode("utf-8", errors="replace")
         except Exception:
             pass
-        raise RuntimeError(f"HTTP {e.code}: {err_body or e.reason}") from e
+        raise RuntimeError(f"BringSMS HTTP {e.code}: {err_body or e.reason}") from e
     except URLError as e:
-        raise RuntimeError(f"Ошибка сети: {e.reason}") from e
-    try:
-        return json.loads(raw)
-    except json.JSONDecodeError as exc:
-        raise RuntimeError(f"Некорректный JSON в ответе API.") from exc
+        raise RuntimeError(f"BringSMS сеть: {e.reason}") from e
 
-def _notletters_letter_plain_text(letter_item):
+def bringsms_get_countries(api_key):
+    raw = bringsms_api_call(api_key, "getCountries", timeout=20)
+    try:
+        data = json.loads(raw)
+        return data if isinstance(data, dict) else {}
+    except json.JSONDecodeError:
+        return {}
+
+def bringsms_find_cheapest_ot_country(api_key, max_price=None):
+    raw = bringsms_api_call(api_key, "getPrices", service=BRINGSMS_SERVICE_ANY_OTHER, timeout=25)
+    try:
+        prices = json.loads(raw)
+    except json.JSONDecodeError as exc:
+        raise RuntimeError(f"BringSMS getPrices: неожиданный ответ: {raw[:200]}") from exc
+
+    if not isinstance(prices, dict):
+        raise RuntimeError(f"BringSMS getPrices: неожиданный ответ: {raw[:200]}")
+
+    best = None
+    cheapest_over_limit = None
+    max_p = _parse_rub_price(max_price)
+
+    for country_id, services in prices.items():
+        if country_id in ("detail", "info", "error"):
+            continue
+        svc = _bringsms_ot_entry(services)
+        if not isinstance(svc, dict):
+            continue
+        try:
+            cost = float(svc.get("cost") or svc.get("price") or 0)
+            count = int(svc.get("count") or 0)
+        except (TypeError, ValueError):
+            continue
+        if count <= 0 or cost <= 0:
+            continue
+        try:
+            cid = int(country_id)
+        except (TypeError, ValueError):
+            continue
+        if cheapest_over_limit is None or cost < cheapest_over_limit[0]:
+            cheapest_over_limit = (cost, cid, count)
+        if max_p is not None and cost > max_p:
+            continue
+        if best is None or cost < best[0]:
+            best = (cost, cid, count)
+
+    if best is None:
+        if max_p is not None:
+            if cheapest_over_limit is not None:
+                cmin = cheapest_over_limit[0]
+                raise RuntimeError(
+                    f"Нет номеров Any Other не дороже {max_p:g} ₽ "
+                    f"(самый дешёвый сейчас ~{cmin:g} ₽)"
+                )
+            raise RuntimeError(f"Нет номеров Any Other не дороже {max_p:g} ₽")
+        raise RuntimeError("Нет доступных номеров Any Other (ot)")
+    return best[1], best[0]
+
+def bringsms_buy_number(api_key, country_id, max_price=None):
+    kwargs = {"service": BRINGSMS_SERVICE_ANY_OTHER, "country": int(country_id)}
+    max_p = _parse_rub_price(max_price)
+    if max_p is not None:
+        kwargs["maxPrice"] = max_p
+    raw = bringsms_api_call(api_key, "getNumber", timeout=30, **kwargs)
+    if raw.startswith("ACCESS_NUMBER:"):
+        parts = raw.split(":")
+        if len(parts) >= 3:
+            return parts[1], parts[2]
+    raise RuntimeError(f"BringSMS getNumber: {raw}")
+
+def bringsms_set_status(api_key, activation_id, status):
+    return bringsms_api_call(api_key, "setStatus", id=str(activation_id), status=int(status))
+
+def bringsms_poll_sms_code(api_key, activation_id, timeout=300, poll_interval=5, log_cb=None):
+    deadline = time.time() + timeout
+    while time.time() < deadline:
+        raw = bringsms_api_call(api_key, "getStatus", id=str(activation_id), timeout=20)
+        if raw.startswith("STATUS_OK:"):
+            return raw.split(":", 1)[1].strip()
+        if raw == "STATUS_WAIT_CODE":
+            if log_cb:
+                log_cb("BringSMS: жду SMS…")
+            time.sleep(poll_interval)
+            continue
+        if raw == "STATUS_CANCEL":
+            raise RuntimeError("Активация номера отменена (STATUS_CANCEL)")
+        time.sleep(poll_interval)
+    raise TimeoutError("SMS-код не пришёл за отведённое время")
+
+def _normalize_phone_digits(phone):
+    return re.sub(r"\D", "", phone or "")
+
+def bringsms_split_phone_for_ui(phone, country_id, countries_data=None):
+    digits = _normalize_phone_digits(phone)
+    dial = ""
+    if countries_data:
+        info = countries_data.get(str(country_id)) or countries_data.get(country_id)
+        if isinstance(info, dict):
+            dial = _normalize_phone_digits(str(info.get("phone") or info.get("dial") or ""))
+    if dial and digits.startswith(dial):
+        local = digits[len(dial):]
+    elif dial and digits.startswith("0" + dial):
+        local = digits[len(dial) + 1:]
+    else:
+        local = digits
+        dial = dial or ""
+    dial_display = f"+{dial}" if dial else "+"
+    return dial_display, local
+
+def bringsms_buy_cheapest_ot(api_key, max_price=None, log_cb=None):
+    country_id, cost = bringsms_find_cheapest_ot_country(api_key, max_price)
+    if log_cb:
+        log_cb(f"BringSMS: Any Other, страна {country_id}, цена ~{cost:g} ₽")
+    buy_max = _parse_rub_price(max_price)
+    if buy_max is None:
+        buy_max = cost
+    activation_id, phone = bringsms_buy_number(api_key, country_id, max_price=buy_max)
+    countries = bringsms_get_countries(api_key)
+    dial, local = bringsms_split_phone_for_ui(phone, country_id, countries)
+    return activation_id, phone, country_id, dial, local
+
+def _letter_plain_text(letter_item):
     inner = letter_item.get("letter") or {}
     text = (inner.get("text") or "").strip()
     if text:
@@ -304,6 +612,13 @@ def _notletters_letter_plain_text(letter_item):
     t = re.sub(r"(?is)<style[^>]*>.*?</style>", " ", t)
     t = re.sub(r"<[^>]+>", " ", t)
     return re.sub(r"\s+", " ", t).strip()
+
+def _is_cursor_email(letter_item):
+    """Письмо от Cursor (по отправителю или теме)."""
+    subj = (letter_item.get("subject") or "").lower()
+    sender = (letter_item.get("sender") or "").lower()
+    sender_name = (letter_item.get("sender_name") or "").lower()
+    return "cursor" in f"{subj} {sender} {sender_name}"
 
 def _is_verification_email_subject(subj):
     """Тема вроде «Подтвердите ваш адрес электронной почты» и близкие варианты (RU/EN)."""
@@ -319,7 +634,7 @@ def _is_verification_email_subject(subj):
         return True
     return False
 
-def _notletters_date_key(item):
+def _letter_date_key(item):
     try:
         return int(item.get("date") or 0)
     except (TypeError, ValueError):
@@ -327,100 +642,72 @@ def _notletters_date_key(item):
 
 def _letters_ordered_for_code_search(letters):
     """Сначала письма с темой подтверждения почты (новые выше), затем остальные по дате."""
-    by_date = sorted(letters, key=_notletters_date_key, reverse=True)
+    by_date = sorted(letters, key=_letter_date_key, reverse=True)
     pri, rest = [], []
     for L in by_date:
         (pri if _is_verification_email_subject(L.get("subject")) else rest).append(L)
     return pri + rest
 
-_CODE_RES = (
-    re.compile(r"\b(\d{6})\b"),
-    re.compile(r"(?i)(?:code|код|otp|pin|verification)[^\d]{0,40}(\d{4,8})\b"),
-    re.compile(r"(?<![\d])(\d{4,8})(?![\d])"),
-)
+_YEAR_LIKE_CODE = re.compile(r"^(19|20)\d{2}$")
 
-def _extract_code_from_single_letter(letter_item):
-    blob = _notletters_letter_plain_text(letter_item)
-    subj = letter_item.get("subject") or ""
-    sender = (letter_item.get("sender") or "") + " " + (letter_item.get("sender_name") or "")
-    combined = f"{blob}\n{subj}\n{sender}"
-    for cre in _CODE_RES:
-        m = cre.search(combined)
-        if m:
-            return m.group(1)
+def _score_verification_code(code, context_lower):
+    score = 0
+    if not code or not code.isdigit():
+        return -1
+    if len(code) == 6:
+        score += 100
+    elif len(code) == 5:
+        score += 55
+    elif len(code) in (4, 7, 8):
+        score += 25
+    if _YEAR_LIKE_CODE.match(code):
+        score -= 90
+    if any(k in context_lower for k in ("code", "код", "otp", "verification", "verify", "confirm", "подтверд")):
+        score += 45
+    return score
+
+def _extract_code_from_text_blob(text):
+    if not text:
+        return None
+    best_code = None
+    best_score = -1
+    for m in re.finditer(r"\b(\d{6})\b", text):
+        code = m.group(1)
+        ctx = text[max(0, m.start() - 50): m.end() + 30].lower()
+        sc = _score_verification_code(code, ctx)
+        if sc > best_score:
+            best_score = sc
+            best_code = code
+    for m in re.finditer(
+        r"(?i)(?:code|код|otp|pin|verification|verify|confirm|подтверд)[^\d]{0,50}(\d{4,8})\b",
+        text,
+    ):
+        code = m.group(1)
+        if _YEAR_LIKE_CODE.match(code):
+            continue
+        ctx = text[max(0, m.start() - 20): m.end() + 20].lower()
+        sc = _score_verification_code(code, ctx)
+        if sc > best_score:
+            best_score = sc
+            best_code = code
+    if best_code and best_score > 0:
+        return best_code
+    for m in re.finditer(r"(?<![\d])(\d{4,8})(?![\d])", text):
+        code = m.group(1)
+        if _YEAR_LIKE_CODE.match(code) or len(code) != 6:
+            continue
+        return code
     return None
 
-def extract_code_from_notletters_response(data):
-    """
-    Ищет код по письмам: приоритет у тем вроде «Подтвердите ваш адрес…», не только последнее письмо.
-    Возвращает (код или None, описание письма с которого взят код / последнего, число писем).
-    """
-    letters = []
-    if isinstance(data, dict):
-        inner = data.get("data") or {}
-        letters = inner.get("letters") or []
-    if not letters:
-        return None, None, 0
-
-    ordered = _letters_ordered_for_code_search(letters)
-    for L in ordered:
-        code = _extract_code_from_single_letter(L)
+def _extract_code_from_single_letter(letter_item):
+    body = _letter_plain_text(letter_item)
+    subj = letter_item.get("subject") or ""
+    sender = (letter_item.get("sender") or "") + " " + (letter_item.get("sender_name") or "")
+    for source in (body, subj, sender):
+        code = _extract_code_from_text_blob(source)
         if code:
-            meta = f"{L.get('subject') or ''} | {L.get('sender') or ''}".strip(" |")
-            return code, meta, len(letters)
-
-    newest = max(letters, key=_notletters_date_key)
-    meta = f"{newest.get('subject') or ''} | {newest.get('sender') or ''}".strip(" |")
-    return None, meta, len(letters)
-
-def notletters_fetch_code_best_effort(api_token, email, password):
-    """
-    Два запроса к API параллельно (узкий search + полный ящик) — время ≈ max(оба), не сумма.
-    Код ищем сначала в ответе узкого поиска, затем в полном.
-    Возвращает (data, code, meta, n_letters, err_str).
-    """
-    email = (email or "").strip()
-    pwd = password or ""
-    token = (api_token or "").strip()
-
-    narrow_data = full_data = None
-    errs = []
-
-    with ThreadPoolExecutor(max_workers=2) as ex:
-        f_n = ex.submit(
-            notletters_fetch_letters,
-            token,
-            email,
-            pwd,
-            8,
-            {"search": "Подтвердите"},
-        )
-        f_f = ex.submit(notletters_fetch_letters, token, email, pwd, 10, None)
-        try:
-            narrow_data = f_n.result(timeout=12)
-        except Exception as e:
-            errs.append(str(e))
-        try:
-            full_data = f_f.result(timeout=12)
-        except Exception as e:
-            errs.append(str(e))
-
-    for data in (narrow_data, full_data):
-        if data is None:
-            continue
-        code, meta, n = extract_code_from_notletters_response(data)
-        if code:
-            return data, code, meta, n, None
-
-    if full_data is not None:
-        code, meta, n = extract_code_from_notletters_response(full_data)
-        return full_data, code, meta, n, None
-    if narrow_data is not None:
-        code, meta, n = extract_code_from_notletters_response(narrow_data)
-        return narrow_data, code, meta, n, None
-
-    err = errs[0] if len(errs) == 1 else ("; ".join(errs) if errs else "Нет ответа от API")
-    return None, None, None, 0, err
+            return code
+    return None
 
 def _windows_http_url_progid():
     """ProgId браузера по умолчанию для http(s) в Windows."""
@@ -642,23 +929,62 @@ def selenium_create_driver_windows_default(log_fn=None, instance_index=None):
     raise last_err
 
 def get_chrome_version():
-    """Пытается определить версию Chrome"""
-    try:
-        key = winreg.OpenKey(winreg.HKEY_LOCAL_MACHINE, r"Software\Google\Chrome\BLBeacon")
-        version, _ = winreg.QueryValueEx(key, "version")
-        return version.split('.')[0]
-    except:
+    """Мажорная версия Chrome (например 148) или None."""
+    for hive in (winreg.HKEY_LOCAL_MACHINE, winreg.HKEY_CURRENT_USER):
         try:
-            key = winreg.OpenKey(winreg.HKEY_CURRENT_USER, r"Software\Google\Chrome\BLBeacon")
+            key = winreg.OpenKey(hive, r"Software\Google\Chrome\BLBeacon")
             version, _ = winreg.QueryValueEx(key, "version")
-            return version.split('.')[0]
-        except:
-            return None
+            return str(version).split(".")[0]
+        except OSError:
+            continue
+    return None
+
+def _chrome_major_version():
+    v = get_chrome_version()
+    if not v:
+        return None
+    try:
+        return int(v)
+    except ValueError:
+        return None
+
+def _uc_likely_supported(chrome_major):
+    """undetected_chromedriver часто отстаёт от свежего Chrome и зависает на скачивании драйвера."""
+    if chrome_major is None:
+        return True
+    return 100 <= chrome_major <= 145
+
+def _run_driver_factory_with_timeout(label, factory, log_fn, timeout_sec=60):
+    """Запуск драйвера в отдельном потоке — не зависать бесконечно на uc.Chrome()."""
+    log_fn(f"{label}: ожидание запуска (до {timeout_sec} сек)…")
+    with ThreadPoolExecutor(max_workers=1) as ex:
+        fut = ex.submit(factory)
+        try:
+            return fut.result(timeout=timeout_sec), None
+        except FuturesTimeoutError:
+            log_fn(f"⚠ {label}: таймаут {timeout_sec} сек — пробуем другой способ.")
+            return None, TimeoutError(f"{label}: таймаут {timeout_sec} сек")
+        except Exception as e:
+            return None, e
+
+def _build_registration_chrome_options(ChromeOptions, *, ud_arg=None, lang_arg=None):
+    o = ChromeOptions()
+    o.add_experimental_option("detach", True)
+    _set_page_load_eager(o)
+    _configure_chromium_stealth_options(o)
+    o.add_argument("--window-size=1366,768")
+    o.add_argument("--no-first-run")
+    o.add_argument("--no-default-browser-check")
+    if lang_arg:
+        o.add_argument(f"--lang={lang_arg}")
+    if ud_arg:
+        o.add_argument(ud_arg)
+    return o
 
 def selenium_create_registration_driver(log_fn=None, instance_index=None):
     """
-    Драйвер для регистрации: приоритет Chrome (undetected), затем обычный Chrome,
-    затем системный браузер по умолчанию.
+    Драйвер для регистрации: Chrome через Selenium Manager, затем undetected (если версия
+    поддерживается), затем системный браузер по умолчанию.
     instance_index: для Chromium — временный user-data-dir и свой --lang на каждое окно (0, 1, …).
     Если None — без отдельного профиля и без смены языка (для совместимости).
     """
@@ -666,24 +992,42 @@ def selenium_create_registration_driver(log_fn=None, instance_index=None):
     log_fn("Запуск браузера для регистрации...")
 
     from selenium import webdriver
-    try:
-        import undetected_chromedriver as uc
-        use_uc = True
-    except ImportError:
-        use_uc = False
+    from selenium.webdriver.chrome.options import Options as ChromeOptions
 
-    chrome_version = get_chrome_version()
-    if chrome_version:
-        log_fn(f"Обнаружена версия Chrome: {chrome_version}")
+    chrome_major = _chrome_major_version()
+    if chrome_major:
+        log_fn(f"Обнаружена версия Chrome: {chrome_major}")
 
     ud_arg = _chromium_temp_user_data_arg(instance_index)
     lang_arg = _chromium_lang_for_instance(instance_index)
 
-    # Попытка 1: undetected_chromedriver
-    if use_uc:
-        try:
-            log_fn("Используем undetected_chromedriver...")
-            from selenium.webdriver.chrome.options import Options as ChromeOptions
+    # Попытка 1: Chrome + Selenium Manager (надёжно для свежих версий вроде 148)
+    def _start_selenium_chrome():
+        o = _build_registration_chrome_options(
+            ChromeOptions, ud_arg=ud_arg, lang_arg=lang_arg
+        )
+        drv = webdriver.Chrome(options=o)
+        _chromium_apply_stealth_cdp(drv)
+        return drv
+
+    drv, err = _run_driver_factory_with_timeout(
+        "Chrome (Selenium Manager)", _start_selenium_chrome, log_fn, timeout_sec=60
+    )
+    if drv is not None:
+        log_fn("✓ Chrome WebDriver запущен (Selenium Manager)")
+        return drv
+    if err and not isinstance(err, TimeoutError):
+        log_fn(f"⚠ Chrome (Selenium Manager): {err}")
+
+    # Попытка 2: undetected_chromedriver — только для «стабильных» версий Chrome
+    try:
+        import undetected_chromedriver as uc
+        has_uc = True
+    except ImportError:
+        has_uc = False
+
+    if has_uc and _uc_likely_supported(chrome_major):
+        def _start_uc_chrome():
             o = uc.ChromeOptions()
             _set_page_load_eager(o)
             o.add_argument("--window-size=1366,768")
@@ -694,53 +1038,48 @@ def selenium_create_registration_driver(log_fn=None, instance_index=None):
                 o.add_argument(f"--lang={lang_arg}")
             if ud_arg:
                 o.add_argument(ud_arg)
-            
-            if chrome_version:
-                try:
-                    drv = uc.Chrome(options=o, version_main=int(chrome_version))
-                except Exception:
-                    drv = uc.Chrome(options=o)
-            else:
-                drv = uc.Chrome(options=o)
-            
+            kwargs = {"options": o, "use_subprocess": True}
+            if chrome_major:
+                kwargs["version_main"] = chrome_major
+            return uc.Chrome(**kwargs)
+
+        log_fn("Пробуем undetected_chromedriver…")
+        drv, err = _run_driver_factory_with_timeout(
+            "undetected_chromedriver", _start_uc_chrome, log_fn, timeout_sec=45
+        )
+        if drv is not None:
             log_fn("✓ undetected_chromedriver запущен успешно")
             return drv
-        except Exception as e:
-            log_fn(f"⚠ undetected_chromedriver не сработал: {e}")
+        if err and not isinstance(err, TimeoutError):
+            log_fn(f"⚠ undetected_chromedriver: {err}")
+    elif has_uc and chrome_major:
+        log_fn(
+            f"Chrome {chrome_major} слишком новый для undetected_chromedriver — "
+            "пропускаем (часто зависает на подборе драйвера)."
+        )
 
-    # Попытка 2: Обычный Chrome с нашими stealth-настройками
+    # Попытка 3: системный браузер по умолчанию (Edge / Firefox)
     try:
-        log_fn("Попытка обычного Chrome WebDriver с улучшенным скрытием...")
-        from selenium.webdriver.chrome.options import Options as ChromeOptions
-        o = ChromeOptions()
-        o.add_experimental_option("detach", True)
-        _set_page_load_eager(o)
-        _configure_chromium_stealth_options(o)
-        o.add_argument("--window-size=1366,768")
-        if lang_arg:
-            o.add_argument(f"--lang={lang_arg}")
-        if ud_arg:
-            o.add_argument(ud_arg)
-        drv = webdriver.Chrome(options=o)
-        _chromium_apply_stealth_cdp(drv)
-        log_fn("✓ Обычный Chrome WebDriver запущен")
-        return drv
-    except Exception as e:
-        log_fn(f"⚠ Ошибка при запуске обычного Chrome: {e}")
-
-    # Попытка 3: Системный по умолчанию (Edge/Firefox)
-    try:
-        log_fn("Попытка системного браузера по умолчанию...")
-        return selenium_create_driver_windows_default(log_fn, instance_index=instance_index)
+        log_fn("Попытка системного браузера по умолчанию…")
+        drv, err = _run_driver_factory_with_timeout(
+            "Системный браузер",
+            lambda: selenium_create_driver_windows_default(log_fn, instance_index=instance_index),
+            log_fn,
+            timeout_sec=60,
+        )
+        if drv is not None:
+            return drv
+        if err:
+            log_fn(f"✗ Системный браузер: {err}")
     except Exception as e:
         log_fn(f"✗ Ошибка системного браузера: {e}")
 
     messagebox.showerror("Ошибка браузера",
         "Не удалось запустить браузер.\n\n"
         "Решения:\n"
-        "1. Обновите Google Chrome и Edge до последней версии\n"
-        "2. Установите: pip install undetected-chromedriver\n"
-        "3. Убедитесь, что нет зависших процессов браузера")
+        "1. Обновите Google Chrome и Microsoft Edge\n"
+        "2. Закройте зависшие процессы chrome.exe / chromedriver.exe в диспетчере задач\n"
+        "3. Установите: pip install selenium undetected-chromedriver")
     raise Exception("Не удалось создать WebDriver")
 
 def _human_move_and_click(driver, element, *, quick=False):
@@ -907,6 +1246,89 @@ def _selenium_click_first(driver, candidates, timeout_each=6, humanize=False):
             return True
         except Exception:
             continue
+    return False
+
+def _selenium_find_phone_input_pair(driver):
+    """Пара полей: код страны (+212) и остальные цифры номера."""
+    from selenium.webdriver.common.by import By
+
+    cc = [e for e in driver.find_elements(By.CSS_SELECTOR, "input[autocomplete='tel-country-code']") if e.is_displayed()]
+    nat = [e for e in driver.find_elements(By.CSS_SELECTOR, "input[autocomplete='tel-national']") if e.is_displayed()]
+    if cc and nat:
+        return cc[0], nat[0]
+
+    tel_inputs = [
+        e for e in driver.find_elements(
+            By.CSS_SELECTOR,
+            "input[type='tel'], input[name*='phone'], input[name*='Phone'], "
+            "input[placeholder*='+' i], input[placeholder*='телефон' i], input[placeholder*='phone' i]",
+        )
+        if e.is_displayed()
+    ]
+    if len(tel_inputs) >= 2:
+        return tel_inputs[0], tel_inputs[1]
+
+    for label_hint in ("телефон", "phone", "mobile", "номер"):
+        try:
+            inputs = driver.find_elements(
+                By.XPATH,
+                f"//*[contains(translate(., 'ABCDEFGHIJKLMNOPQRSTUVWXYZ', 'abcdefghijklmnopqrstuvwxyz'), '{label_hint}')]"
+                f"/following::input[not(@type='hidden')][1]"
+                f"|//*[contains(translate(., 'ABCDEFGHIJKLMNOPQRSTUVWXYZ', 'abcdefghijklmnopqrstuvwxyz'), '{label_hint}')]"
+                f"/following::input[not(@type='hidden')][2]",
+            )
+            vis = [e for e in inputs if e.is_displayed()]
+            if len(vis) >= 2:
+                return vis[0], vis[1]
+        except Exception:
+            continue
+    return None, None
+
+def _selenium_wait_phone_fields(driver, timeout=120):
+    deadline = time.time() + timeout
+    while time.time() < deadline:
+        cc, nat = _selenium_find_phone_input_pair(driver)
+        if cc and nat:
+            return cc, nat
+        time.sleep(1)
+    return None, None
+
+def _selenium_find_otp_fields(driver):
+    from selenium.webdriver.common.by import By
+
+    multi = driver.find_elements(By.CSS_SELECTOR, "input[inputmode='numeric'][maxlength='1']")
+    vis_multi = [e for e in multi if e.is_displayed()]
+    if len(vis_multi) >= 4:
+        return None, vis_multi
+    for by, sel in (
+        (By.CSS_SELECTOR, "input[autocomplete='one-time-code']"),
+        (By.CSS_SELECTOR, "input[inputmode='numeric']"),
+        (By.XPATH, "//input[contains(@placeholder,'код') or contains(@placeholder,'Код') or contains(@placeholder,'code') or contains(@placeholder,'Code')]"),
+    ):
+        for el in driver.find_elements(by, sel):
+            try:
+                t = (el.get_attribute("type") or "").lower()
+                if t in ("password", "email", "hidden"):
+                    continue
+                if el.is_displayed() and el.get_attribute("maxlength") != "1":
+                    return el, None
+            except Exception:
+                continue
+    return None, None
+
+def _selenium_wait_registration_success(driver, timeout=120):
+    """Ждёт подтверждения успешной регистрации по URL."""
+    deadline = time.time() + timeout
+    while time.time() < deadline:
+        try:
+            url = (driver.current_url or "").lower()
+        except Exception:
+            url = ""
+        if "cursor.com" in url and "sign-up" not in url and "login" not in url:
+            return True
+        if "authenticator.cursor.sh" in url and "/sign-up" not in url:
+            return True
+        time.sleep(2)
     return False
 
 def _refresh_internet_settings():
@@ -1469,15 +1891,21 @@ class App(tk.Tk):
         self.gen_pass   = tk.StringVar()
         self.gen_email_login = tk.StringVar()
         self.gen_email_pass = tk.StringVar()
-        self.notletters_api_var = tk.StringVar()
-        self.notletters_code_var = tk.StringVar(value="")
+        self.verification_code_var = tk.StringVar(value="")
+        self.account_password_mode_var = tk.StringVar(value="generated")
+        self.custom_account_password_var = tk.StringVar()
+        self.bringsms_api_var = tk.StringVar()
+        self.bringsms_max_price_var = tk.StringVar()
         self.proxy_var = tk.StringVar()
         self.proxy_type_var = tk.StringVar(value="SOCKS5")
         self.status_var = tk.StringVar(value="Готов к работе")
         self.accounts_gen_reg_count_var = tk.IntVar(value=1)
 
         _cfg = load_app_config()
-        self.notletters_api_var.set(_cfg.get("notletters_api_key") or "")
+        self.account_password_mode_var.set(_cfg.get("account_password_mode") or "generated")
+        self.custom_account_password_var.set(_cfg.get("custom_account_password") or "")
+        self.bringsms_api_var.set(_cfg.get("bringsms_api_key") or "")
+        self.bringsms_max_price_var.set(_cfg.get("bringsms_max_price") or "")
 
         self._detect_mail_file()
         self._build_ui()
@@ -1623,6 +2051,51 @@ class App(tk.Tk):
         btn_row3.pack(fill="x", pady=(4, 0))
         big_button(btn_row3, "Сгенерировать и зарегистрировать", self._generate_and_register_accounts, "#1d4ed8").pack(fill="x")
 
+        pwd_block = tk.Frame(left_col, bg=SURFACE3, padx=12, pady=12, highlightthickness=1, highlightbackground=BORDER)
+        pwd_block.pack(fill="x", pady=(0, 12))
+        sec_label(pwd_block, "ПАРОЛЬ АККАУНТА CURSOR").pack(anchor="w", pady=(0, 6))
+        pwd_mode_row = tk.Frame(pwd_block, bg=SURFACE3)
+        pwd_mode_row.pack(fill="x")
+        for txt, val in (
+            ("Авто (сгенерировать)", "generated"),
+            ("Как у почты", "email"),
+            ("Свой пароль", "custom"),
+        ):
+            tk.Radiobutton(
+                pwd_mode_row,
+                text=txt,
+                value=val,
+                variable=self.account_password_mode_var,
+                command=self._on_account_password_mode_changed,
+                bg=SURFACE3,
+                fg=TEXT,
+                selectcolor=SURFACE2,
+                activebackground=SURFACE3,
+                activeforeground=TEXT,
+                font=("Segoe UI", 9),
+                highlightthickness=0,
+                bd=0,
+            ).pack(anchor="w", pady=1)
+        self.custom_pwd_row = tk.Frame(pwd_block, bg=SURFACE3)
+        self.custom_pwd_row.pack(fill="x", pady=(6, 0))
+        tk.Label(
+            self.custom_pwd_row,
+            text="Свой пароль",
+            bg=SURFACE3,
+            fg=TEXT_DIM,
+            font=("Segoe UI", 9),
+            width=16,
+            anchor="w",
+        ).pack(side="left")
+        self.custom_account_password_entry = styled_entry(
+            self.custom_pwd_row,
+            textvariable=self.custom_account_password_var,
+            width=28,
+            show="•",
+        )
+        self.custom_account_password_entry.pack(side="left", fill="x", expand=True, padx=(4, 0))
+        self.custom_account_password_entry.bind("<FocusOut>", lambda e: self._persist_user_settings())
+
         proxy_block = tk.Frame(left_col, bg=SURFACE3, padx=12, pady=12, highlightthickness=1, highlightbackground=BORDER)
         proxy_block.pack(fill="x", pady=(0, 12))
         sec_label(proxy_block, "ПРОКСИ").pack(anchor="w", pady=(0, 6))
@@ -1670,10 +2143,9 @@ class App(tk.Tk):
         links_frame.pack(fill="x")
         links = [
             ("Cursor", "https://cursor.com/dashboard/settings"),
-            ("Войти в почту", "https://notletters.com/email/login"),
-            ("Купить почты (напрямую)", "https://notletters.com/user"),
-            ("Купить почты (через посредника)", "https://t.me/GloryProjectBot"),
-            ("Получить Ваш API ключ NotLetters", "https://notletters.com/user/settings"),
+            ("Войти в почту Rambler", "https://mail.rambler.ru/"),
+            ("BringSMS API / бот", "https://t.me/bringsmsbot"),
+            ("Документация BringSMS", "https://doc.bring-sms.store/"),
 	    ("Инструкция по CursorTool / GitHub CursorTool", "https://github.com/pr0cr4st1n4t10n/CursorTool"),
             ("Разработчик CursorTool", "https://pr0cr4st1n4t10n.github.io/"),
         ]
@@ -1703,18 +2175,19 @@ class App(tk.Tk):
 
         nl_block = tk.Frame(right_col, bg=SURFACE3, padx=12, pady=10, highlightthickness=1, highlightbackground=BORDER)
         nl_block.pack(fill="x", pady=(0, 12))
-        sec_label(nl_block, "NOTLETTERS API").pack(anchor="w", pady=(0, 6))
-        api_row = tk.Frame(nl_block, bg=SURFACE3)
-        api_row.pack(fill="x", pady=(0, 8))
-        tk.Label(api_row, text="API-ключ", bg=SURFACE3, fg=TEXT_DIM,
-                 font=("Segoe UI", 9), width=16, anchor="w").pack(side="left")
-        self.notletters_api_entry = styled_entry(api_row, textvariable=self.notletters_api_var, width=28, show="•")
-        self.notletters_api_entry.pack(side="left", fill="x", expand=True, padx=(4, 0))
-        self.notletters_api_entry.bind("<FocusOut>", lambda e: self._persist_notletters_api())
+        sec_label(nl_block, "ПОЧТА RAMBLER / КОД ПОДТВЕРЖДЕНИЯ").pack(anchor="w", pady=(0, 6))
+        tk.Label(
+            nl_block,
+            text="Код берётся только из писем от Cursor.",
+            bg=SURFACE3,
+            fg=TEXT_MUTED,
+            font=("Segoe UI", 8),
+            justify="left",
+        ).pack(anchor="w", pady=(0, 8))
         big_button(
             nl_block,
-            "Получить последний код с почты NotLetters",
-            self._fetch_last_code_notletters,
+            "Получить последний код с почты",
+            self._fetch_last_code,
             ACCENT2,
         ).pack(fill="x")
 
@@ -1729,15 +2202,47 @@ class App(tk.Tk):
             width=16,
             anchor="w",
         ).pack(side="left")
-        self.notletters_code_entry = styled_entry(
+        self.verification_code_entry = styled_entry(
             code_row,
-            textvariable=self.notletters_code_var,
+            textvariable=self.verification_code_var,
             font=("Consolas", 12),
         )
-        self.notletters_code_entry.pack(side="left", fill="x", expand=True, padx=(4, 8))
-        self.notletters_code_entry.config(state="readonly", readonlybackground=SURFACE2)
-        copy_nl = icon_button(code_row, "Скопировать", self._copy_notletters_code_field)
-        copy_nl.pack(side="left")
+        self.verification_code_entry.pack(side="left", fill="x", expand=True, padx=(4, 8))
+        self.verification_code_entry.config(state="readonly", readonlybackground=SURFACE2)
+        icon_button(code_row, "Скопировать", self._copy_verification_code_field).pack(side="left")
+
+        bringsms_block = tk.Frame(right_col, bg=SURFACE3, padx=12, pady=10, highlightthickness=1, highlightbackground=BORDER)
+        bringsms_block.pack(fill="x", pady=(0, 12))
+        sec_label(bringsms_block, "BRINGSMS (ВИРТУАЛЬНЫЙ НОМЕР)").pack(anchor="w", pady=(0, 6))
+        tk.Label(
+            bringsms_block,
+            text="При запросе телефона: покупка номера Any Other (самый дешёвый).",
+            bg=SURFACE3,
+            fg=TEXT_MUTED,
+            font=("Segoe UI", 8),
+            justify="left",
+        ).pack(anchor="w", pady=(0, 6))
+        bs_api_row = tk.Frame(bringsms_block, bg=SURFACE3)
+        bs_api_row.pack(fill="x", pady=(0, 4))
+        tk.Label(bs_api_row, text="API-ключ", bg=SURFACE3, fg=TEXT_DIM,
+                 font=("Segoe UI", 9), width=16, anchor="w").pack(side="left")
+        self.bringsms_api_entry = styled_entry(bs_api_row, textvariable=self.bringsms_api_var, width=28, show="•")
+        self.bringsms_api_entry.pack(side="left", fill="x", expand=True, padx=(4, 0))
+        self.bringsms_api_entry.bind("<FocusOut>", lambda e: self._persist_user_settings())
+        bs_price_row = tk.Frame(bringsms_block, bg=SURFACE3)
+        bs_price_row.pack(fill="x")
+        tk.Label(bs_price_row, text="Макс. цена ₽", bg=SURFACE3, fg=TEXT_DIM,
+                 font=("Segoe UI", 9), width=16, anchor="w").pack(side="left")
+        self.bringsms_max_price_entry = styled_entry(bs_price_row, textvariable=self.bringsms_max_price_var, width=12)
+        self.bringsms_max_price_entry.pack(side="left", padx=(4, 0))
+        self.bringsms_max_price_entry.bind("<FocusOut>", lambda e: self._persist_user_settings())
+        tk.Label(
+            bs_price_row,
+            text="пусто = самый дешёвый",
+            bg=SURFACE3,
+            fg=TEXT_MUTED,
+            font=("Segoe UI", 8),
+        ).pack(side="left", padx=(8, 0))
 
         log_header = tk.Frame(right_col, bg=right_col["bg"])
         log_header.pack(fill="x", pady=(0, 6))
@@ -1760,6 +2265,15 @@ class App(tk.Tk):
         status_bar.pack(fill="x", side="bottom")
         tk.Label(status_bar, textvariable=self.status_var, bg="#101014", fg=TEXT_DIM,
                  font=("Segoe UI", 9)).pack(anchor="w")
+
+        self._on_account_password_mode_changed()
+
+    def _on_account_password_mode_changed(self):
+        mode = (self.account_password_mode_var.get() or "generated").strip().lower()
+        self.custom_pwd_row.pack_forget()
+        if mode == "custom":
+            self.custom_pwd_row.pack(fill="x", pady=(6, 0))
+        self._persist_user_settings()
 
     def _find_banner_image(self):
         candidates = [
@@ -1859,17 +2373,21 @@ class App(tk.Tk):
             )
             return
 
-        api_key = self.notletters_api_var.get().strip()
-        if not api_key:
+        pwd_mode = (self.account_password_mode_var.get() or "generated").strip().lower()
+        custom_pwd = self.custom_account_password_var.get().strip()
+        if pwd_mode == "custom" and not custom_pwd:
             messagebox.showwarning(
-                "NotLetters",
-                "Введите API-ключ NotLetters — по нему запрашивается код из письма.",
+                "Пароль аккаунта",
+                "Выбран режим «Свой пароль» — введите пароль для регистрации Cursor.",
             )
             return
 
+        bringsms_key = self.bringsms_api_var.get().strip()
+        bringsms_max = self.bringsms_max_price_var.get().strip()
+
         threading.Thread(
             target=self._generate_and_register_accounts_worker,
-            args=(n, path, api_key),
+            args=(n, path, pwd_mode, custom_pwd, bringsms_key, bringsms_max),
             daemon=True,
         ).start()
 
@@ -1881,37 +2399,53 @@ class App(tk.Tk):
         self.gen_email_login.set(snap["email"])
         self.gen_email_pass.set(snap["email_pass"])
 
-    def _generate_and_register_accounts_worker(self, n, path, api_key):
-        """Фон: для каждого слота — взять почту из файла, сгенерировать личность, сохранить, затем регистрация."""
-        snaps = []
-        for idx in range(n):
-            creds = pop_email_credentials_from_file(path)
-            if not creds:
-                self.log(f"✗ [{idx + 1}/{n}] Нет строки почты в файле — прерываю генерацию.")
-                break
-            email_login, email_password = creds
-            first = random.choice(FIRST_NAMES)
-            last = random.choice(LAST_NAMES)
-            pwd = generate_password()
+    def _commit_registered_account(self, mail_path, snap):
+        """После успешной регистрации: удалить почту из файла и сохранить аккаунт."""
+        with _FILE_COMMIT_LOCK:
+            removed = remove_email_credentials_from_file(mail_path, snap["email"])
             save_account(
-                first,
-                last,
-                email_login,
-                email_password,
-                pwd,
+                snap["first"],
+                snap["last"],
+                snap["email"],
+                snap["email_pass"],
+                snap["account_pass"],
                 filepath=data_file_path("accounts.txt"),
             )
+        line = format_account_line(snap["email"], snap["email_pass"], snap["account_pass"]).strip()
+        if removed:
+            self.log(f"✓ Почта {snap['email']} удалена из файла, сохранено в accounts.txt ({line})")
+        else:
+            self.log(f"✓ Сохранено в accounts.txt ({line}); почта не найдена в файле для удаления")
+
+    def _generate_and_register_accounts_worker(self, n, path, pwd_mode, custom_pwd, bringsms_key, bringsms_max):
+        """Фон: подготовить данные, зарегистрировать; файлы меняются только после успеха."""
+        creds_list = list_email_credentials_from_file(path)[:n]
+        if not creds_list:
+            self.after(
+                0,
+                lambda: messagebox.showerror(
+                    "Генерация",
+                    "Не удалось прочитать почты из файла.",
+                ),
+            )
+            return
+
+        snaps = []
+        for idx, (email_login, email_password) in enumerate(creds_list):
+            first = random.choice(FIRST_NAMES)
+            last = random.choice(LAST_NAMES)
+            pwd = resolve_account_password(pwd_mode, email_password, custom_pwd)
             snap = {
                 "first": first,
                 "last": last,
                 "email": email_login,
                 "email_pass": email_password,
                 "account_pass": pwd,
-                "api": api_key,
+                "bringsms_api": bringsms_key,
+                "bringsms_max_price": bringsms_max,
             }
             snaps.append(snap)
-            mail_info = email_login if email_login else "без почты"
-            self.log(f"✓ [{len(snaps)}/{n}] Сгенерирован аккаунт: {first} {last} | {mail_info}")
+            self.log(f"✓ [{idx + 1}/{n}] Подготовлен аккаунт: {first} {last} | {email_login}")
 
         if not snaps:
             self.after(
@@ -1929,20 +2463,24 @@ class App(tk.Tk):
         self.log(f"Запуск регистрации в браузере для {len(snaps)} аккаунт(ов)…")
 
         if len(snaps) == 1:
-            threading.Thread(
-                target=self._register_with_generated_data_worker,
-                args=(snaps[0],),
-                kwargs={"instance_id": 0, "parallel_total": 1},
-                daemon=True,
-            ).start()
+            def _run_single():
+                ok = self._register_with_generated_data_worker(
+                    snaps[0], instance_id=0, parallel_total=1
+                )
+                if ok:
+                    self._commit_registered_account(path, snaps[0])
+                else:
+                    self.log(f"✗ Регистрация не удалась для {snaps[0]['email']} — почта остаётся в файле.")
+
+            threading.Thread(target=_run_single, daemon=True).start()
         else:
             threading.Thread(
                 target=self._register_parallel_supervisor,
-                args=(snaps,),
+                args=(snaps, path),
                 daemon=True,
             ).start()
 
-    def _register_parallel_supervisor(self, snaps):
+    def _register_parallel_supervisor(self, snaps, mail_path):
         """Несколько окон с разными snap; общий снимок буфера до/после."""
         if not snaps:
             return
@@ -1964,9 +2502,13 @@ class App(tk.Tk):
 
         def _run_reg(snap, idx, total):
             time.sleep(0.28 * idx + random.uniform(0, 0.14))
-            self._register_with_generated_data_worker(
+            ok = self._register_with_generated_data_worker(
                 snap, instance_id=idx, parallel_total=total
             )
+            if ok:
+                self._commit_registered_account(mail_path, snap)
+            else:
+                self.log(f"✗ Регистрация не удалась для {snap['email']} — почта остаётся в файле.")
 
         for i, snap in enumerate(snaps):
             t = threading.Thread(
@@ -1999,9 +2541,9 @@ class App(tk.Tk):
         email = snap["email"]
         email_pass = snap["email_pass"]
         account_pass = snap["account_pass"]
-        api_key = snap["api"]
 
         owns_clipboard_restore = parallel_total == 1
+        success = False
         clip_snapshot = None
         if owns_clipboard_restore:
             try:
@@ -2136,7 +2678,7 @@ class App(tk.Tk):
             time.sleep(random.uniform(0.4, 0.85))
             _switch_latest_tab()
 
-            log_reg("Регистрация: опрашиваю NotLetters и жду поле для кода (до ~4 мин)…")
+            log_reg("Регистрация: опрашиваю Rambler и жду письмо от Cursor (до ~4 мин)…")
             self.after(0, lambda: self.status_var.set("Запрос кода с почты…"))
 
             code = None
@@ -2145,15 +2687,17 @@ class App(tk.Tk):
             otp_multi = None
             while time.time() < deadline:
                 try:
-                    _data, code_try, meta, _n, err = notletters_fetch_code_best_effort(api_key, email, email_pass)
+                    _data, code_try, meta, _n, err = fetch_verification_code_best_effort(
+                        email, email_pass
+                    )
                     if err:
                         pass
                     elif code_try:
                         code = code_try
-                        log_reg(f"Регистрация: код из письма: {code}" + (f" ({meta})" if meta else ""))
-                        self.after(0, lambda c=code: self._set_notletters_code_field(c))
+                        log_reg(f"Регистрация: код из письма Cursor: {code}" + (f" ({meta})" if meta else ""))
+                        self.after(0, lambda c=code: self._set_verification_code_field(c))
                 except Exception as ex:
-                    log_reg(f"⚠ Запрос кода NotLetters: {ex}")
+                    log_reg(f"⚠ Запрос кода (Rambler): {ex}")
 
                 otp_multi = _find_otp_multi()
                 otp_single = _find_otp_single() if not otp_multi else None
@@ -2167,7 +2711,9 @@ class App(tk.Tk):
                 time.sleep(4)
 
             if not code:
-                raise TimeoutException("Код из почты не получен за отведённое время. Проверьте API-ключ и ящик.")
+                raise TimeoutException(
+                    "Код из письма Cursor не получен за отведённое время — проверьте ящик и пароль почты."
+                )
 
             wait_otp_deadline = time.time() + 90
             while time.time() < wait_otp_deadline and not otp_single and not otp_multi:
@@ -2191,7 +2737,88 @@ class App(tk.Tk):
                     "Код получен, но поле для ввода кода на странице не найдено. Введите код вручную."
                 )
 
-            self.after(0, lambda: self.status_var.set("Код введён в браузер"))
+            self.after(0, lambda: self.status_var.set("Код e-mail введён в браузер"))
+            time.sleep(random.uniform(1.2, 2.4))
+            _switch_latest_tab()
+
+            bringsms_key = (snap.get("bringsms_api") or "").strip()
+            bringsms_max = snap.get("bringsms_max_price") or ""
+            phone_cc, phone_local = _selenium_wait_phone_fields(driver, timeout=25)
+            if phone_cc and phone_local:
+                if not bringsms_key:
+                    raise TimeoutException(
+                        "На странице запрошен телефон, но не указан API-ключ BringSMS."
+                    )
+                log_reg("Регистрация: требуется телефон — покупка номера через BringSMS (Any Other)…")
+                self.after(0, lambda: self.status_var.set("Покупка виртуального номера BringSMS…"))
+                activation_id = None
+                try:
+                    activation_id, _phone_raw, _country_id, dial, local = bringsms_buy_cheapest_ot(
+                        bringsms_key, bringsms_max, log_cb=log_reg
+                    )
+                    log_reg(f"BringSMS: номер {dial}{local} (активация {activation_id})")
+                    _selenium_paste_human(driver, phone_cc, dial, quick=True)
+                    time.sleep(random.uniform(0.2, 0.45))
+                    _selenium_paste_human(driver, phone_local, local, quick=True)
+                    time.sleep(random.uniform(0.25, 0.5))
+                    if not _selenium_click_first(driver, submit_locs, timeout_each=12, humanize=True):
+                        log_reg("⚠ Регистрация: нажмите кнопку продолжения после телефона вручную.")
+                    time.sleep(random.uniform(1.0, 2.0))
+                    _switch_latest_tab()
+
+                    log_reg("BringSMS: ожидание SMS-кода (до ~5 мин)…")
+                    self.after(0, lambda: self.status_var.set("Ожидание SMS-кода…"))
+                    sms_code = bringsms_poll_sms_code(
+                        bringsms_key, activation_id, timeout=300, log_cb=log_reg
+                    )
+                    log_reg(f"BringSMS: SMS-код: {sms_code}")
+                    self.after(0, lambda c=sms_code: self._set_verification_code_field(c))
+
+                    sms_otp_single = None
+                    sms_otp_multi = None
+                    sms_deadline = time.time() + 90
+                    while time.time() < sms_deadline:
+                        sms_otp_single, sms_otp_multi = _selenium_find_otp_fields(driver)
+                        if sms_otp_single or sms_otp_multi:
+                            break
+                        time.sleep(1)
+
+                    if sms_otp_multi:
+                        _selenium_paste_human(driver, sms_otp_multi[0], sms_code.strip(), quick=True)
+                        log_reg("Регистрация: SMS-код вставлен в многоячеечное поле.")
+                    elif sms_otp_single:
+                        _selenium_paste_human(driver, sms_otp_single, sms_code, quick=True)
+                        log_reg("Регистрация: SMS-код введён в одиночное поле.")
+                    else:
+                        raise TimeoutException(
+                            "SMS-код получен, но поле ввода на странице не найдено. Введите вручную."
+                        )
+
+                    try:
+                        bringsms_set_status(bringsms_key, activation_id, 6)
+                        log_reg("BringSMS: активация завершена.")
+                    except Exception as ex:
+                        log_reg(f"⚠ BringSMS setStatus(6): {ex}")
+                    self.after(0, lambda: self.status_var.set("SMS-код введён в браузер"))
+                except Exception:
+                    if activation_id:
+                        try:
+                            bringsms_set_status(bringsms_key, activation_id, 8)
+                            log_reg("BringSMS: активация отменена (возврат средств при отсутствии SMS).")
+                        except Exception:
+                            pass
+                    raise
+            else:
+                log_reg("Регистрация: запрос телефона не появился — продолжаем без BringSMS.")
+                self.after(0, lambda: self.status_var.set("Регистрация: телефон не требуется"))
+
+            log_reg("Регистрация: проверяю успешное завершение…")
+            self.after(0, lambda: self.status_var.set("Проверка регистрации…"))
+            if not _selenium_wait_registration_success(driver, timeout=120):
+                raise TimeoutException("Не удалось подтвердить успешную регистрацию.")
+            log_reg("✓ Регистрация успешно завершена.")
+            self.after(0, lambda: self.status_var.set("Регистрация завершена"))
+            success = True
         except TimeoutException as e:
             msg = str(e) or "Таймаут ожидания на странице."
             log_reg(f"✗ Регистрация: {msg}")
@@ -2208,6 +2835,7 @@ class App(tk.Tk):
                         pyperclip.copy(clip_snapshot)
                 except Exception:
                     pass
+        return success
 
     def _copy(self, text):
         if text:
@@ -2356,7 +2984,15 @@ class App(tk.Tk):
     def _apply_generated_account(self, email_login, email_password, show_toast=False):
         first = random.choice(FIRST_NAMES)
         last  = random.choice(LAST_NAMES)
-        pwd   = generate_password()
+        pwd_mode = (self.account_password_mode_var.get() or "generated").strip().lower()
+        custom_pwd = self.custom_account_password_var.get().strip()
+        if pwd_mode == "custom" and not custom_pwd:
+            messagebox.showwarning(
+                "Пароль аккаунта",
+                "Выбран режим «Свой пароль» — введите пароль в поле ниже.",
+            )
+            return
+        pwd = resolve_account_password(pwd_mode, email_password, custom_pwd)
 
         self.gen_first.set(first)
         self.gen_last.set(last)
@@ -2367,7 +3003,7 @@ class App(tk.Tk):
         save_account(first, last, email_login, email_password, pwd, filepath=data_file_path("accounts.txt"))
         mail_info = email_login if email_login else "без почты"
         self.log(f"✓ Аккаунт создан: {first} {last} | {mail_info}")
-        self.log(f"  Сохранено в accounts.txt")
+        self.log(f"  Сохранено в accounts.txt ({format_account_line(email_login, email_password, pwd).strip()})")
         self.status_var.set(f"Аккаунт создан: {first} {last}")
         if show_toast:
             self._show_toast(
@@ -2439,23 +3075,28 @@ class App(tk.Tk):
             messagebox.showerror("Прокси", f"Не удалось отключить прокси:\n{e}")
 
     def _on_close(self):
-        self._persist_notletters_api()
+        self._persist_user_settings()
         self.destroy()
 
-    def _persist_notletters_api(self):
-        save_notletters_api_key(self.notletters_api_var.get())
+    def _persist_user_settings(self):
+        save_app_config_values(
+            account_password_mode=self.account_password_mode_var.get(),
+            custom_account_password=self.custom_account_password_var.get(),
+            bringsms_api_key=self.bringsms_api_var.get(),
+            bringsms_max_price=self.bringsms_max_price_var.get(),
+        )
 
-    def _set_notletters_code_field(self, text):
-        self.notletters_code_var.set(text or "")
-        ent = self.notletters_code_entry
+    def _set_verification_code_field(self, text):
+        self.verification_code_var.set(text or "")
+        ent = self.verification_code_entry
         ent.config(state="normal")
         ent.delete(0, "end")
         if text:
             ent.insert(0, text)
         ent.config(state="readonly")
 
-    def _copy_notletters_code_field(self):
-        t = (self.notletters_code_var.get() or "").strip()
+    def _copy_verification_code_field(self):
+        t = (self.verification_code_var.get() or "").strip()
         if not t:
             self.status_var.set("Поле кода пустое")
             return
@@ -2464,60 +3105,54 @@ class App(tk.Tk):
         self.log(f"Скопирован код: {t}")
         self.status_var.set("Код скопирован в буфер обмена")
 
-    def _fetch_last_code_notletters(self):
-        api_key = self.notletters_api_var.get().strip()
+    def _fetch_last_code(self):
         email = self.gen_email_login.get().strip()
         pwd = self.gen_email_pass.get().strip()
-        if not api_key:
-            messagebox.showwarning("NotLetters", "Введите API-ключ NotLetters.")
-            return
         if not email or not pwd:
             messagebox.showwarning(
-                "NotLetters",
+                "Rambler",
                 "Нет данных почты.\nСначала сгенерируйте аккаунт или заполните поля «Почта (логин)» и «Почта (пароль)».",
             )
             return
-        self._set_notletters_code_field("")
-        self.log("Запрос писем через NotLetters API (параллельно: фильтр + полный ящик)…")
-        self.status_var.set("Загрузка почты NotLetters…")
+        self._set_verification_code_field("")
+        self.log("Запрос писем через IMAP Rambler (только от Cursor)…")
+        self.status_var.set("Загрузка почты Rambler…")
 
         def work():
             code = meta = None
             n_letters = 0
             err = None
             try:
-                _data, code, meta, n_letters, err = notletters_fetch_code_best_effort(
-                    api_key, email, pwd
-                )
+                _data, code, meta, n_letters, err = fetch_verification_code_best_effort(email, pwd)
             except Exception as e:
                 err = str(e)
             self.after(
                 0,
-                lambda c=code, m=meta, n=n_letters, er=err: self._on_notletters_fetch_done(c, m, n, er),
+                lambda c=code, m=meta, n=n_letters, er=err: self._on_fetch_code_done(c, m, n, er),
             )
 
         threading.Thread(target=work, daemon=True).start()
 
-    def _on_notletters_fetch_done(self, code, meta, n_letters, err):
-        self._persist_notletters_api()
+    def _on_fetch_code_done(self, code, meta, n_letters, err):
+        self._persist_user_settings()
         if err:
-            self._set_notletters_code_field("")
-            self.log(f"✗ NotLetters API: {err}")
-            self.status_var.set("Ошибка NotLetters API")
-            messagebox.showerror("NotLetters", f"Не удалось получить письма:\n{err}")
+            self._set_verification_code_field("")
+            self.log(f"✗ Rambler: {err}")
+            self.status_var.set("Ошибка Rambler")
+            messagebox.showerror("Rambler", f"Не удалось получить письма:\n{err}")
             return
-        self.log(f"✓ Ответ API: писем в ящике: {n_letters}")
+        self.log(f"✓ Rambler: писем от Cursor: {n_letters}")
         if n_letters == 0:
-            self._set_notletters_code_field("")
-            self.log("  В ящике пока нет писем.")
-            self.status_var.set("Нет писем в ящике")
-            messagebox.showinfo("NotLetters", "В ящике нет писем.")
+            self._set_verification_code_field("")
+            self.log("  Писем от Cursor пока нет.")
+            self.status_var.set("Нет писем от Cursor")
+            messagebox.showinfo("Rambler", "В ящике нет писем от Cursor.")
             return
         if code:
-            self._set_notletters_code_field(code)
+            self._set_verification_code_field(code)
             self.clipboard_clear()
             self.clipboard_append(code)
-            self.log(f"✓ Код из письма: {code}")
+            self.log(f"✓ Код из письма Cursor: {code}")
             if meta:
                 self.log(f"  ({meta})")
             self.status_var.set("Код получен (также в буфере обмена)")
@@ -2528,14 +3163,14 @@ class App(tk.Tk):
                 "#dcfce7",
             )
         else:
-            self._set_notletters_code_field("")
-            self.log("⚠ В последнем письме не удалось распознать код автоматически.")
+            self._set_verification_code_field("")
+            self.log("⚠ В письме Cursor не удалось распознать код автоматически.")
             if meta:
                 self.log(f"  Письмо: {meta}")
             self.status_var.set("Код в письме не найден")
             messagebox.showinfo(
-                "NotLetters",
-                "Письма получены, но код не распознан автоматически.\n"
+                "Rambler",
+                "Письмо от Cursor найдено, но код не распознан автоматически.\n"
                 "Откройте почту на сайте или проверьте текст письма вручную.",
             )
 
